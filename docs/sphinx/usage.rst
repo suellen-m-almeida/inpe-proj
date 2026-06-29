@@ -35,7 +35,7 @@ Import the ``wtss`` class and then use it to create an object to retrieve the ti
 
     from wtss import *
 
-    service = WTSS('https://brazildatacube.dpi.inpe.br', access_token='CHANGE_ME')
+    service = WTSS('https://data.inpe.br/bdc/wtss/v4/', access_token='CHANGE_ME')
 
 
 
@@ -143,7 +143,7 @@ Output::
 
 To list the available coverages in a service, use the ``list-coverages`` command and provides a URL to the ``--url`` option::
 
-    wtss list-coverages --url https://brazildatacube.dpi.inpe.br
+    wtss list-coverages --url https://data.inpe.br/bdc/wtss/v4/
 
 
 Output::
@@ -162,7 +162,7 @@ Output::
 
 To get more information about a specific coverage, use the ``describe`` command::
 
-    wtss describe --coverage MOD13Q1-6 --url https://brazildatacube.dpi.inpe.br
+    wtss describe --coverage mod13q1-6.1 --url https://data.inpe.br/bdc/wtss/v4/
 
 
 Output:
@@ -185,11 +185,11 @@ Output:
 
 Finally, to retrieve the time series over a coverage in a specific location::
 
-    wtss ts --coverage MOD13Q1-6 \
-            --attributes red \
+    wtss ts --coverage mod13q1-6.1 \
+            --attributes NDVI \
             --longitude -54 --latitude -12 \
-            --start-date 2001-01-01 --end-date 2001-12-31 \
-            --url https://brazildatacube.dpi.inpe.br \
+            --start-datetime 2001-01-01 --end-datetime 2001-12-31 \
+            --url https://data.inpe.br/bdc/wtss/v4/ \
             --access-token CHANGE_ME
 
 

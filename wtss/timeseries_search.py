@@ -71,7 +71,7 @@ class TimeSeriesSearch:
         import shapely.geometry
         from wtss import WTSS
 
-        service = WTSS('https://brazildatacube.dpi.inpe.br/dev/wtss/v2/', access_token='<personal-token>')
+        service = WTSS('https://data.inpe.br/bdc/wtss/v4/', access_token='<personal-token>')
         coverage = service['S2-16D-2']
         timeseries = coverage.ts(attributes=('NDVI',),
                                  geom=shapely.geometry.MultiPoint([
