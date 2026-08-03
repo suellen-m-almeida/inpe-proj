@@ -114,9 +114,12 @@ def ts(verbose, url, coverage, attributes,
 
     cv = service[coverage]
 
+    # --attributes is a comma-separated string; the client/server expect a list.
+    attribute_list = [a.strip() for a in attributes.split(',')] if attributes else None
+
     search = cv.ts(latitude=latitude,
                    longitude=longitude,
-                   attributes=attributes,
+                   attributes=attribute_list,
                    start_datetime=start_datetime,
                    end_datetime=end_datetime)
 

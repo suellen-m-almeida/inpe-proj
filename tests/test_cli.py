@@ -87,3 +87,29 @@ class TestTs:
         assert result.exit_code == 0, result.output
         assert 'NDVI' in result.output
         assert 'timeline' in result.output
+
+    @responses.activate
+    def test_ts_sends_attributes_as_list(self):
+        """Regression: ``--attributes`` is comma-separated text, but the client
+        and server expect a list. Passing the raw string reached the server as
+        ``"NDVI"`` and made the real server answer 400 (the mock accepted any
+        body, so only a live run exposed it). The CLI must split it into a list.
+        """
+        import json
+
+        _register_root(responses.mock)
+        _register_coverage(responses.mock)
+        _register_timeseries(responses.mock)
+        runner = CliRunner()
+        result = runner.invoke(cli, [
+            'ts', '-u', MOCK_URL, '-c', 'MOD13Q1-6', '-a', 'NDVI,EVI',
+            '--latitude', '-12', '--longitude', '-54',
+            '--start-datetime', '2017-01-01', '--end-datetime', '2017-02-28',
+        ])
+        assert result.exit_code == 0, result.output
+
+        timeseries_calls = [call for call in responses.calls
+                            if call.request.url.endswith('/timeseries')]
+        assert timeseries_calls, 'no timeseries request was made'
+        body = json.loads(timeseries_calls[-1].request.body)
+        assert body['attributes'] == ['NDVI', 'EVI']
