@@ -455,18 +455,26 @@ class TimeSeries:
 
             for location in locations[:_limit]:
                 values = [value if value != nodata else None for value in location.series['values'][band_name]]
-                axis.plot(x, values, ls='-', linewidth=1, color='#7F9BB1', alpha=alpha)
+                # The pixel band is self-explanatory, so it is kept out of the legend.
+                axis.plot(x, values, ls='-', linewidth=1, color='#7F9BB1', alpha=alpha,
+                          label='_nolegend_')
 
             if stats:
-                for quantile_name in ['q1', 'q3']:
+                for i, quantile_name in enumerate(['q1', 'q3']):
                     quantile = numpy.ma.array(summarize.values(band_name).values(quantile_name))
                     quantile.mask = quantile == nodata
-                    axis.plot(x, quantile.tolist(fill_value=None)[:len(x)], color='#b19541', linewidth=1.5)
+                    # Label only the first quantile so q1 and q3 share one entry.
+                    axis.plot(x, quantile.tolist(fill_value=None)[:len(x)], color='#b19541', linewidth=1.5,
+                              label='quartis (q1, q3)' if i == 0 else '_nolegend_')
 
                 median = numpy.ma.array(summarize.values(band_name).values('median'))
                 median.mask = median == nodata
-                axis.plot(x, median.tolist(fill_value=None)[:len(x)], label=f'{band_name} median',
+                axis.plot(x, median.tolist(fill_value=None)[:len(x)], label='mediana',
                           color='#B16240', linewidth=2.5)
+
+            # Legend for the median and quartiles (only drawn when stats are on).
+            if stats:
+                axis.legend(loc='upper right', fontsize=12)
 
             axis.text(-0.05, 0.5, f"{band_name}", transform=axis.transAxes, rotation=90, va='center', ha='left', fontsize=20) #Adjust subplot title position. Displacement ranges from 0 to 1. Negative to left and bottom, positive to right and up.
             fig.canvas.draw()

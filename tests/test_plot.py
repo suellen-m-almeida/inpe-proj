@@ -188,7 +188,10 @@ class TestPlotHappyPath:
         # raw series (1) + q1 + q3 + median == 4 lines.
         assert len(axis.lines) == 4
         labels = [line.get_label() for line in axis.lines]
-        assert 'NDVI median' in labels
+        # Legend entries: quartiles and median (the pixel band is excluded).
+        assert 'quartis (q1, q3)' in labels
+        assert 'mediana' in labels
+        assert 'pixels' not in labels
 
     def test_nodata_is_masked_to_none(self, service):
         """The ``-3000`` nodata sample must not be plotted as a real value."""
