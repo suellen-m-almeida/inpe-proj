@@ -484,6 +484,120 @@ class TimeSeries:
         # Show only after every series has been drawn.
         fig.show()
 
+    def plot_map(self, attribute: str, datetime: Optional[str] = None,
+                 reduce: str = 'mean', apply_scale: bool = False,
+                 mask_nodata: bool = False, ax=None, cmap: str = 'viridis',
+                 markersize: int = 40, legend: bool = True,
+                 basemap: bool = False, source=None, **kwargs):
+        """Plot the queried locations on a map, colored by a band value.
+
+        Complements :meth:`plot` (which shows *time*) by showing *space*: each
+        queried location (a point, or a pixel center for multipoint/polygon
+        queries) is drawn at its geographic position and colored by the value of
+        ``attribute``. Builds a :class:`geopandas.GeoDataFrame` in ``EPSG:4326``
+        and delegates to its ``.plot``.
+
+        Args:
+            attribute (str): The band whose value colors each location.
+            datetime (str, optional): A specific date from the timeline. When
+                ``None`` (default), the value is reduced over the whole timeline
+                using ``reduce``.
+            reduce (str): How to collapse the time axis when ``datetime`` is
+                ``None``: one of ``'mean'``, ``'median'``, ``'min'``, ``'max'``.
+            apply_scale (bool): Apply the band scale/offset client-side (Ciclo iv).
+            mask_nodata (bool): Replace nodata samples with ``NaN`` before
+                reducing, so the sentinel does not skew the color (Ciclo iv).
+            ax (matplotlib.axes.Axes, optional): Existing axes to draw on.
+            cmap (str): Matplotlib colormap name. Defaults to ``'viridis'``.
+            markersize (int): Point size. Defaults to 40.
+            legend (bool): Draw the colorbar. Defaults to True.
+            basemap (bool): Add an OpenStreetMap basemap via ``contextily``
+                (needs network and the optional ``contextily`` package).
+                Defaults to False so the map stays offline-friendly.
+            source: Tile provider for the basemap (e.g.
+                ``contextily.providers.OpenStreetMap.Mapnik``). When ``None``
+                (default) and ``basemap`` is True, OpenStreetMap Mapnik is used.
+            **kwargs: Forwarded to :meth:`geopandas.GeoDataFrame.plot`.
+
+        Returns:
+            matplotlib.axes.Axes: The axes with the map.
+
+        Raises:
+            ValueError: If there are no locations, ``reduce`` is unknown, or
+                ``datetime`` is not in the timeline.
+            KeyError: If ``attribute`` is not present in the time series.
+            ImportError: If geopandas/matplotlib (or contextily) are missing.
+        """
+        try:
+            import geopandas
+            import matplotlib.pyplot as plt
+        except ImportError:
+            raise ImportError('You should install geopandas and matplotlib!')
+
+        locations = list(self._locations.values())
+        if not locations:
+            raise ValueError('No locations to plot.')
+
+        if attribute not in locations[0].series['values']:
+            raise KeyError(
+                f"Attribute '{attribute}' not found. Available: "
+                f"{list(locations[0].series['values'])}"
+            )
+
+        reducers = {
+            'mean': numpy.nanmean, 'median': numpy.nanmedian,
+            'min': numpy.nanmin, 'max': numpy.nanmax,
+        }
+        if datetime is None and reduce not in reducers:
+            raise ValueError(f"reduce must be one of {list(reducers)}, got {reduce!r}")
+
+        geoms, values = [], []
+        for location in locations:
+            samples = self._values_for(location, attribute, apply_scale, mask_nodata)
+            if datetime is None:
+                value = float(reducers[reduce](numpy.array(samples, dtype='float64')))
+            else:
+                timeline = location.timeline
+                if datetime not in timeline:
+                    raise ValueError(f'{datetime!r} is not in the timeline.')
+                value = samples[timeline.index(datetime)]
+            geoms.append(location.geom)
+            values.append(value)
+
+        gdf = geopandas.GeoDataFrame({attribute: values}, geometry=geoms, crs='EPSG:4326')
+
+        if ax is None:
+            _, ax = plt.subplots(figsize=(8, 8))
+
+        gdf.plot(column=attribute, ax=ax, cmap=cmap, markersize=markersize,
+                 legend=legend, **kwargs)
+
+        if basemap:
+            try:
+                import contextily
+            except ImportError:
+                raise ImportError('Install contextily for basemaps: pip install contextily')
+            if source is None:
+                source = contextily.providers.OpenStreetMap.Mapnik
+            # Suppress contextily's built-in credit (bottom-left, on top of the
+            # data) and re-add it just below the axes so it never covers points.
+            contextily.add_basemap(ax, crs=gdf.crs, source=source, attribution=False)
+            attribution = getattr(source, 'attribution', '') or ''
+            if attribution:
+                # Draw the credit vertically just outside the right edge of the
+                # map, in the gap before the colorbar, so it never covers data.
+                ax.annotate(attribution, xy=(1.02, 0.5), xycoords='axes fraction',
+                            rotation=90, rotation_mode='anchor',
+                            ha='left', va='center', fontsize=6, color='gray',
+                            annotation_clip=False)
+
+        when = datetime if datetime is not None else f'{reduce} over timeline'
+        ax.set_title(f'{self._coverage.name} — {attribute} ({when})')
+        ax.set_xlabel('longitude')
+        ax.set_ylabel('latitude')
+
+        return ax
+
     def _repr_pretty_(self, p, cycle):
         """Customize how the REPL pretty-prints a time series."""
         return self._repr_html_()

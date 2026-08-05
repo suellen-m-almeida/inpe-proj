@@ -232,6 +232,22 @@ class TimeSeriesSearch:
         ts.plot(**kwargs)
         self._ts = ts
 
+    def plot_map(self, attribute: str, **kwargs):
+        """Plot the queried locations on a map, colored by a band value.
+
+        Assembles the full time series (following pagination) and delegates to
+        :meth:`wtss.timeseries.TimeSeries.plot_map`.
+
+        Args:
+            attribute (str): The band whose value colors each location.
+            **kwargs: Forwarded to :meth:`TimeSeries.plot_map` (e.g. ``datetime``,
+                ``reduce``, ``cmap``, ``basemap``).
+
+        Returns:
+            matplotlib.axes.Axes: The axes with the map.
+        """
+        return self.ts.plot_map(attribute, **kwargs)
+
     def iterator(self, progress: bool = False) -> Iterator['TimeSeries']:
         """Iterate that yields :class:`wtss.timeseries.TimeSeries` instances for each time series group matching the given query parameters.
 

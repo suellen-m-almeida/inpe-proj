@@ -206,6 +206,19 @@ def test_plot_headless(point_ts):
     plt.close('all')
 
 
+def test_plot_map_headless(multipoint_ts):
+    matplotlib = pytest.importorskip('matplotlib')
+    pytest.importorskip('geopandas')
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    ax = multipoint_ts.plot_map(ATTR, legend=False)
+    # One PathCollection carrying every queried location.
+    assert len(ax.collections) == 1
+    assert ax.collections[0].get_offsets().shape[0] == multipoint_ts.total_locations
+    plt.close('all')
+
+
 # --------------------------------------------------------------------------- #
 # Command-line interface.
 # --------------------------------------------------------------------------- #

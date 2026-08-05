@@ -285,6 +285,96 @@ class TestPlotFixedBugs:
         # Before the fix this was 0 (show ran first); now the series are drawn.
         assert captured['lines'] > 0
 
+
+def _multipoint_timeseries(service, n_points=3):
+    """Return a materialised multi-location :class:`TimeSeries` (NDVI only)."""
+    coverage = service['MOD13Q1-6']
+    results = [
+        {
+            'pixel_center': {'type': 'Point', 'coordinates': [-54.0 + i * 0.01, -12.0]},
+            'pixel_size': [231.65, 231.65],
+            'time_series': {
+                'timeline': TIMELINE,
+                'values': {'NDVI': [1000 + i, 2000 + i, 3000 + i]},
+            },
+        }
+        for i in range(n_points)
+    ]
+    data = {
+        'results': results,
+        'query': {**POINT_TS_RESPONSE['query'], 'attributes': ['NDVI']},
+    }
+    return TimeSeries(coverage, data)
+
+
+class TestPlotMap:
+    """Offline coverage for the spatial map view ``TimeSeries.plot_map``."""
+
+    def test_single_point_draws_one_marker(self, service):
+        ts = _point_timeseries(service)
+        ax = ts.plot_map('NDVI', legend=False)
+
+        # geopandas renders points as a single PathCollection with one point.
+        assert len(ax.collections) == 1
+        assert ax.collections[0].get_offsets().shape[0] == 1
+
+    def test_multipoint_colors_all_locations(self, service):
+        ts = _multipoint_timeseries(service, n_points=3)
+        ax = ts.plot_map('NDVI', legend=False)
+
+        offsets = ax.collections[0].get_offsets()
+        assert offsets.shape[0] == 3
+        # Points are laid out along increasing longitude, at fixed latitude.
+        assert [round(x, 2) for x, _ in offsets] == [-54.0, -53.99, -53.98]
+
+    def test_reduce_mean_colors_by_time_average(self, service):
+        ts = _multipoint_timeseries(service, n_points=2)
+        ax = ts.plot_map('NDVI', reduce='mean', legend=False)
+
+        # Location 0 = mean(1000,2000,3000)=2000; location 1 = mean(1001,2001,3001)=2001.
+        values = list(ax.collections[0].get_array())
+        assert values == [2000.0, 2001.0]
+
+    def test_datetime_selects_a_single_date(self, service):
+        ts = _multipoint_timeseries(service, n_points=2)
+        ax = ts.plot_map('NDVI', datetime='2017-01-17', legend=False)
+
+        # Second timeline position: 2000 and 2001.
+        assert list(ax.collections[0].get_array()) == [2000.0, 2001.0]
+
+    def test_mask_nodata_turns_sentinel_into_nan(self, service):
+        """With mask_nodata, the -3000 sentinel is NaN and does not skew the mean."""
+        ts = _point_timeseries(service)  # NDVI = [1000, -3000, 3000], nodata -3000
+        ax = ts.plot_map('NDVI', reduce='mean', mask_nodata=True, legend=False)
+
+        # nanmean(1000, nan, 3000) == 2000, not (1000-3000+3000)/3.
+        assert list(ax.collections[0].get_array()) == [2000.0]
+
+    def test_unknown_attribute_raises_keyerror(self, service):
+        ts = _point_timeseries(service)
+        with pytest.raises(KeyError, match='RED'):
+            ts.plot_map('RED')  # band absent from the time series
+
+    def test_unknown_reduce_raises_valueerror(self, service):
+        ts = _point_timeseries(service)
+        with pytest.raises(ValueError, match='reduce must be one of'):
+            ts.plot_map('NDVI', reduce='sum')
+
+    def test_datetime_out_of_timeline_raises(self, service):
+        ts = _point_timeseries(service)
+        with pytest.raises(ValueError, match='not in the timeline'):
+            ts.plot_map('NDVI', datetime='1999-01-01')
+
+    def test_deferred_search_plot_map_delegates(self, service):
+        search = service['MOD13Q1-6'].ts(
+            attributes=['NDVI'],
+            geom=POINT_GEOM,
+            start_datetime='2017-01-01',
+            end_datetime='2017-02-28',
+        )
+        ax = search.plot_map('NDVI', legend=False)
+        assert len(ax.collections) == 1
+
     def test_empty_attributes_raise_clear_error_B12(self, service):
         """B12: an empty attribute list is rejected with a clear message."""
         coverage = service['MOD13Q1-6']
