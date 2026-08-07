@@ -381,7 +381,9 @@ class TimeSeries:
                                         end_datetime=end_datetime,
                                         attributes=self._data['query']['attributes'])
 
-    def plot(self, stats: bool = True, limit: Optional[int] = None, **options):
+    def plot(self, stats: bool = True, limit: Optional[int] = None,
+             pixels: bool = True, apply_scale: bool = False,
+             mask_nodata: bool = False, **options):
         """Plot the time series on a chart.
 
         Args:
@@ -389,6 +391,16 @@ class TimeSeries:
                 (Only applied on Time Series per Area)
             limit (Optiona[int]): Limit the number of time series to plot. Default is None.
                 When None, display all. You may have performance issues.
+            pixels (bool): Draw one faint line per pixel/location. Default is True.
+                Set to False to show only the statistics (median and quartiles),
+                which is cleaner when ``stats`` is on and there are many pixels.
+            apply_scale (bool): Apply the band ``scale``/``offset`` client-side, so
+                the Y axis is in the physical unit (e.g. NDVI in -1..1) instead of
+                raw integers. Default is False. When on, nodata is always masked so
+                the sentinel is never scaled.
+            mask_nodata (bool): Replace nodata samples with ``NaN`` (drawn as gaps).
+                Default is False; note the plot already hides nodata visually, so
+                this mainly matters combined with ``apply_scale``.
 
         Keyword Args:
             attributes (sequence): A sequence like ('red', 'nir') or ['red', 'nir'] .
@@ -453,23 +465,32 @@ class TimeSeries:
             attr_def = attribute_map[band_name]
             nodata = attr_def['nodata']
 
-            for location in locations[:_limit]:
-                values = [value if value != nodata else None for value in location.series['values'][band_name]]
-                # The pixel band is self-explanatory, so it is kept out of the legend.
-                axis.plot(x, values, ls='-', linewidth=1, color='#7F9BB1', alpha=alpha,
-                          label='_nolegend_')
+            # Turn a raw sample list into plot-ready values, honoring the
+            # apply_scale/mask_nodata flags. Without them, keep the legacy
+            # behavior (mask nodata to None so it draws as a gap, raw scale).
+            # When scaling, always mask nodata so the sentinel is never scaled.
+            def _prep(raw):
+                if apply_scale or mask_nodata:
+                    return self._coverage._apply_metadata(
+                        list(raw), attr_def, apply_scale, mask_nodata or apply_scale)
+                return [value if value != nodata else None for value in raw]
+
+            if pixels:
+                for location in locations[:_limit]:
+                    values = _prep(location.series['values'][band_name])
+                    # The pixel band is self-explanatory, so it is kept out of the legend.
+                    axis.plot(x, values, ls='-', linewidth=1, color='#7F9BB1', alpha=alpha,
+                              label='_nolegend_')
 
             if stats:
                 for i, quantile_name in enumerate(['q1', 'q3']):
-                    quantile = numpy.ma.array(summarize.values(band_name).values(quantile_name))
-                    quantile.mask = quantile == nodata
+                    quantile = _prep(summarize.values(band_name).values(quantile_name))
                     # Label only the first quantile so q1 and q3 share one entry.
-                    axis.plot(x, quantile.tolist(fill_value=None)[:len(x)], color='#b19541', linewidth=1.5,
+                    axis.plot(x, quantile[:len(x)], color='#b19541', linewidth=1.5,
                               label='quartis (q1, q3)' if i == 0 else '_nolegend_')
 
-                median = numpy.ma.array(summarize.values(band_name).values('median'))
-                median.mask = median == nodata
-                axis.plot(x, median.tolist(fill_value=None)[:len(x)], label='mediana',
+                median = _prep(summarize.values(band_name).values('median'))
+                axis.plot(x, median[:len(x)], label='mediana',
                           color='#B16240', linewidth=2.5)
 
             # Legend for the median and quartiles (only drawn when stats are on).

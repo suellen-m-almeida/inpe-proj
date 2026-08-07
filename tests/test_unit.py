@@ -294,6 +294,29 @@ class TestApplyMetadata:
     def test_missing_scale_leaves_values_untouched(self):
         assert Coverage._apply_metadata([5, 6], {'nodata': -1}) == [5, 6]
 
+    def test_warns_when_data_already_scaled(self):
+        # Fractional samples with a scale set => the server likely delivered
+        # physical units already; applying scale again would double-scale.
+        with pytest.warns(UserWarning, match='double-scale'):
+            Coverage._apply_metadata(
+                [0.86, 0.81, 0.90], {'name': 'NDVI', 'scale': 0.0001, 'nodata': -3000})
+
+    def test_no_warning_on_raw_integers(self):
+        # Genuine raw digital numbers are integers: no false positive.
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter('error')  # any warning becomes an error
+            out = Coverage._apply_metadata(
+                [8600, 8100], {'name': 'NDVI', 'scale': 0.0001})
+        assert out == pytest.approx([0.86, 0.81])
+
+    def test_no_warning_when_scale_disabled(self):
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter('error')
+            Coverage._apply_metadata(
+                [0.86, 0.81], {'name': 'NDVI', 'scale': 0.0001}, apply_scale=False)
+
 
 class TestSslVerification:
     """Regression tests for B19/B20: SSL verification and warning suppression.

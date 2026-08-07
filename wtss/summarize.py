@@ -133,12 +133,19 @@ class Summarize(dict):
 
         return df
 
-    def plot(self, **options):
+    def plot(self, apply_scale: bool = False, mask_nodata: bool = False, **options):
         """Plot the summarized time series on a chart.
 
         Keyword Args:
             attributes (list): A list like ['EVI','NDVI']
             aggregation (str): Desired aggregation to plot (e.g. 'mean')
+
+        Args:
+            apply_scale (bool): Apply the band ``scale``/``offset`` client-side, so
+                the Y axis is in the physical unit instead of raw integers. When on,
+                nodata is always masked so the sentinel is never scaled. Default False.
+            mask_nodata (bool): Replace nodata samples with ``NaN`` (drawn as gaps).
+                Default False.
 
         Raises:
             ImportError: If Maptplotlib or Numpy or datetime could not be imported.
@@ -170,8 +177,14 @@ class Summarize(dict):
         # Add timeserie for each attribute
         x = [parse(d).date() for d in self.timeline]
         for attr in attributes:
-            nodata = attribute_map[attr]['nodata']
-            y = [v if v != nodata else None for v in self.values(attr).values(aggregation)]
+            attr_def = attribute_map[attr]
+            nodata = attr_def['nodata']
+            raw = self.values(attr).values(aggregation)
+            if apply_scale or mask_nodata:
+                y = self._coverage._apply_metadata(
+                    list(raw), attr_def, apply_scale, mask_nodata or apply_scale)
+            else:
+                y = [v if v != nodata else None for v in raw]
             ax.plot(x, y, ls='-', linewidth=1.5, label=attr)
 
         # Define plot properties and show plot
@@ -182,11 +195,19 @@ class Summarize(dict):
         fig.autofmt_xdate()
         plt.show()
 
-    def plot_mean_std(self, **options):
+    def plot_mean_std(self, apply_scale: bool = False, mask_nodata: bool = False, **options):
         """Plot the mean and std of a desired attribute.
 
         Keyword Args:
             attribute (str): Desired attribute to plot (e.g. 'NDVI')
+
+        Args:
+            apply_scale (bool): Apply the band ``scale``/``offset`` client-side so the
+                Y axis is in the physical unit. When on, nodata is always masked so the
+                sentinel is never scaled. The ``std`` is scaled by ``scale`` only (no
+                offset), since it is a dispersion, not an absolute value. Default False.
+            mask_nodata (bool): Replace nodata samples with ``NaN`` (drawn as gaps).
+                Default False.
 
         Raises:
             ImportError: If Maptplotlib or Numpy or datetime could not be imported.
@@ -211,15 +232,33 @@ class Summarize(dict):
             attr['name']: attr
             for attr in self._coverage.attributes
         }
-        nodata = attribute_map[attribute]['nodata']
+        attr_def = attribute_map[attribute]
+        nodata = attr_def['nodata']
 
         # Create plot
         fig, ax = plt.subplots()
 
         # Add mean, mean+std and mean-std timeserie
         x = [parse(d) for d in self.timeline]
-        mean = [v if v != nodata else None for v in self.values(attribute).values('mean')]
-        std = [v if v != nodata else None for v in self.values(attribute).values('std')]
+        if apply_scale or mask_nodata:
+            mean = self._coverage._apply_metadata(
+                list(self.values(attribute).values('mean')), attr_def,
+                apply_scale, mask_nodata or apply_scale)
+            # std is a spread: scale it but never add the offset, and mask the
+            # nodata positions the mean already flagged so the two align.
+            scale = next((attr_def[k] for k in ('scale_factor', 'data_scale', 'scale')
+                          if attr_def.get(k) is not None), 1 if apply_scale else None)
+            std = []
+            for v in self.values(attribute).values('std'):
+                if (mask_nodata or apply_scale) and v == nodata:
+                    std.append(float('nan'))
+                elif apply_scale and scale is not None:
+                    std.append(v * scale)
+                else:
+                    std.append(v)
+        else:
+            mean = [v if v != nodata else None for v in self.values(attribute).values('mean')]
+            std = [v if v != nodata else None for v in self.values(attribute).values('std')]
         mean_add_std = [x+y for (x, y) in zip(mean, std)]
         mean_sub_std = [x-y for (x, y) in zip(mean, std)]
         ax.plot(x, mean, ls='-', linewidth=1.5, label='mean', color='darkgreen')

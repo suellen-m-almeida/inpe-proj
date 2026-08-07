@@ -20,6 +20,7 @@
 
 import json
 import numbers
+import warnings
 from typing import List, Union
 
 import shapely.geometry
@@ -123,6 +124,27 @@ class Coverage(dict):
         nodata = band_meta.get('nodata')
         scale = next((band_meta[k] for k in _SCALE_KEYS if band_meta.get(k) is not None), None)
         offset = next((band_meta[k] for k in _OFFSET_KEYS if band_meta.get(k) is not None), 0)
+
+        # Guard against double-scaling. Raw digital numbers that follow the
+        # scale/nodata contract are integers; if the samples already arrive as
+        # fractional floats, the server most likely delivered physical
+        # (already-scaled) values and scaling again would distort the result
+        # (e.g. NDVI 0.86 -> 0.000086). Warn once instead of silently doing it.
+        if apply_scale and scale not in (None, 0, 1):
+            sample = [v for v in values
+                      if v is not None and v != nodata and isinstance(v, numbers.Real)]
+            if sample:
+                fractional = sum(1 for v in sample if float(v) != int(float(v)))
+                if fractional > len(sample) / 2:
+                    band_name = band_meta.get('name', 'this band')
+                    warnings.warn(
+                        f"apply_scale=True for {band_name!r}, but the samples already "
+                        f"look scaled (mostly non-integer values while scale={scale}). "
+                        f"The server may deliver physical units already; scaling again "
+                        f"would double-scale. Pass apply_scale=False if the data is "
+                        f"already in physical units.",
+                        stacklevel=2,
+                    )
 
         result = []
         for value in values:
