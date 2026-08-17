@@ -267,7 +267,34 @@ class TimeSeries:
         parts = {attr: series.unstack('location') for attr, series in columns.items()}
         return pandas.concat(parts, axis=1, names=['attribute', 'location'])
 
-    def to_xarray(self, apply_scale: bool = False, mask_nodata: bool = False):
+    def _grid_cube(self, attr_name, apply_scale: bool = False, mask_nodata: bool = False):
+        """Rebuild the 2D raster of one attribute as a ``(time, y, x)`` cube.
+
+        Pixels of an area query lie on a regular grid; the distinct longitudes and
+        latitudes define the x/y axes. Cells with no returned pixel stay ``NaN``.
+
+        Returns:
+            tuple: ``(xs, ys, cube)`` with the sorted longitudes ``xs``, latitudes
+            ``ys`` and a ``numpy`` array of shape ``(len(timeline), len(ys), len(xs))``.
+        """
+        import numpy
+
+        locations = list(self._locations.values())
+        xs = sorted({location.x for location in locations})
+        ys = sorted({location.y for location in locations})
+        ix = {x: i for i, x in enumerate(xs)}
+        iy = {y: i for i, y in enumerate(ys)}
+        ntime = len(self.timeline)
+
+        cube = numpy.full((ntime, len(ys), len(xs)), numpy.nan, dtype='float64')
+        for location in locations:
+            values = self._values_for(location, attr_name, apply_scale, mask_nodata)
+            n = min(len(values), ntime)
+            cube[:n, iy[location.y], ix[location.x]] = values[:n]
+        return xs, ys, cube
+
+    def to_xarray(self, apply_scale: bool = False, mask_nodata: bool = False,
+                  grid: bool = False):
         """Return the time series as a labelled :class:`xarray.Dataset` (Ciclo v).
 
         Each attribute becomes a data variable. Dimensions are:
@@ -276,13 +303,16 @@ class TimeSeries:
           coordinates.
         - **Multiple locations**: ``(time, location)``; ``longitude``/``latitude``
           are coordinates along ``location``.
-
-        The polygon case (rebuilding a 2D ``(time, y, x)`` grid from sparse
-        pixels) is not handled here yet.
+        - **Grid (polygon/area)**, with ``grid=True``: ``(time, y, x)``, rebuilding
+          the 2D raster from the sparse pixel centres. ``x``/``y`` are the distinct
+          longitudes/latitudes; grid cells with no returned pixel are ``NaN``.
 
         Args:
             apply_scale (bool): Apply the band scale/offset client-side (Ciclo iv).
             mask_nodata (bool): Replace nodata samples with ``NaN`` (Ciclo iv).
+            grid (bool): Rebuild the 2D ``(time, y, x)`` raster from the pixels of
+                a polygon/area query, instead of the flat ``(time, location)``.
+                Default is False.
 
         Raises:
             ImportError: If xarray (or pandas/numpy) could not be imported.
@@ -301,6 +331,16 @@ class TimeSeries:
             return xarray.Dataset()
 
         time = pandas.to_datetime(self.timeline)
+
+        if grid:
+            # Polygon/area case (Ciclo v): rebuild the 2D raster (time, y, x) from
+            # the sparse pixel centres (see _grid_cube).
+            data_vars = {}
+            xs = ys = None
+            for attr in attributes:
+                xs, ys, cube = self._grid_cube(attr, apply_scale, mask_nodata)
+                data_vars[attr] = (('time', 'y', 'x'), cube)
+            return xarray.Dataset(data_vars, coords={'time': time, 'y': ys, 'x': xs})
 
         if len(locations) == 1:
             location = locations[0]
@@ -624,6 +664,98 @@ class TimeSeries:
         ax.set_title(f'{self._coverage.name} — {attribute} ({when})')
         ax.set_xlabel('longitude')
         ax.set_ylabel('latitude')
+
+        return ax
+
+    def plot_cube(self, attribute: str, apply_scale: bool = False,
+                  mask_nodata: bool = False, ax=None, cmap: str = 'viridis',
+                  title: Optional[str] = None, **kwargs):
+        """Render the area as a 3D **spatiotemporal data cube** ``(time, y, x)``.
+
+        Extends :meth:`plot_map` (a single date, in 2D) into the time axis: each
+        timestamp becomes one horizontal raster layer of ``attribute``, stacked
+        along the vertical (time) axis to form the cube that :meth:`to_xarray`
+        (with ``grid=True``) produces. Meant for polygon/area queries.
+
+        Args:
+            attribute (str): The band that colours each cell.
+            apply_scale (bool): Apply the band scale/offset client-side (Ciclo iv).
+            mask_nodata (bool): Replace nodata samples with ``NaN`` (Ciclo iv).
+            ax (mpl_toolkits.mplot3d.axes3d.Axes3D, optional): Existing 3D axes to
+                draw on. When ``None`` (default) a new 3D figure is created.
+            cmap (str): Matplotlib colormap name. Defaults to ``'viridis'``.
+            title (str, optional): Figure title. Defaults to a generated one.
+            **kwargs: Forwarded to ``Axes3D.plot_surface``.
+
+        Returns:
+            mpl_toolkits.mplot3d.axes3d.Axes3D: The axes with the cube.
+
+        Raises:
+            ValueError: If there are no locations or the area is smaller than 2x2.
+            KeyError: If ``attribute`` is not present in the time series.
+            ImportError: If matplotlib/numpy are missing.
+        """
+        try:
+            import numpy
+            import matplotlib.pyplot as plt
+            from matplotlib import cm, colors
+            from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers '3d')
+        except ImportError:
+            raise ImportError('You should install matplotlib and numpy!')
+
+        locations = list(self._locations.values())
+        if not locations:
+            raise ValueError('No locations to plot.')
+        if attribute not in locations[0].series['values']:
+            raise KeyError(
+                f"Attribute '{attribute}' not found. Available: "
+                f"{list(locations[0].series['values'])}"
+            )
+
+        xs, ys, cube = self._grid_cube(attribute, apply_scale, mask_nodata)
+        if len(xs) < 2 or len(ys) < 2:
+            raise ValueError('plot_cube needs an area (a grid of at least 2x2 pixels).')
+
+        grid_x, grid_y = numpy.meshgrid(numpy.arange(len(xs)), numpy.arange(len(ys)))
+        finite = cube[numpy.isfinite(cube)]
+        vmin = float(finite.min()) if finite.size else 0.0
+        vmax = float(finite.max()) if finite.size else 1.0
+        norm = colors.Normalize(vmin=vmin, vmax=vmax)
+        colormap = plt.get_cmap(cmap)
+
+        created = ax is None
+        if created:
+            fig = plt.figure(figsize=(9, 8))
+            ax = fig.add_subplot(projection='3d')
+        else:
+            fig = ax.figure
+
+        # One raster layer per timestamp, stacked along z = time index.
+        for t in range(cube.shape[0]):
+            z = numpy.full_like(grid_x, t, dtype='float64')
+            ax.plot_surface(grid_x, grid_y, z, facecolors=colormap(norm(cube[t])),
+                            rstride=1, cstride=1, shade=False, **kwargs)
+
+        if created:
+            ax.view_init(elev=22, azim=-60)
+
+        # Axis titles: pull 'longitude'/'latitude' close to their numbers and push
+        # 'time' clear of the (wider) date labels, aiming for a similar gap on all
+        # three. The z tick pad also runs higher because the dates are long.
+        ax.set_xlabel('x (longitude)', labelpad=-2)
+        ax.set_ylabel('y (latitude)', labelpad=-2)
+        ax.set_zlabel('time', labelpad=23)
+        ax.set_zticks(range(cube.shape[0]))
+        ax.set_zticklabels([str(t)[:10] for t in self.timeline], fontsize=8)
+        ax.tick_params(axis='z', pad=12)
+        ax.tick_params(axis='x', pad=-3)
+        ax.tick_params(axis='y', pad=-3)
+        ax.set_title(title or f'{self._coverage.name} — {attribute} (data cube)')
+
+        mappable = cm.ScalarMappable(norm=norm, cmap=colormap)
+        mappable.set_array([])
+        # Extra pad keeps the colorbar off the z (time) axis label.
+        fig.colorbar(mappable, ax=ax, shrink=0.6, pad=0.16, label=attribute)
 
         return ax
 
