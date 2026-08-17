@@ -391,6 +391,127 @@ class TimeSeries:
         dataset = self.to_xarray(apply_scale=apply_scale, mask_nodata=mask_nodata)
         return dataset.to_netcdf(path, **kwargs)
 
+    def to_zarr(self, path, apply_scale: bool = False, mask_nodata: bool = False,
+                grid: bool = False, **kwargs):
+        """Export the time series to a Zarr store, via :meth:`to_xarray` (semana 10).
+
+        Args:
+            path (str): Destination Zarr store (a directory).
+            apply_scale (bool): Apply the band scale/offset client-side (Ciclo iv).
+            mask_nodata (bool): Replace nodata samples with ``NaN`` (Ciclo iv).
+            grid (bool): Export the ``(time, y, x)`` raster cube instead of the flat
+                ``(time, location)`` layout (see :meth:`to_xarray`). Default False.
+            **kwargs: Forwarded to :meth:`xarray.Dataset.to_zarr`.
+
+        Raises:
+            ImportError: If xarray or the ``zarr`` backend is unavailable.
+        """
+        try:
+            import zarr  # noqa: F401  (backend used by xarray)
+        except ImportError:
+            raise ImportError('Install zarr for Zarr export: pip install zarr')
+        dataset = self.to_xarray(apply_scale=apply_scale, mask_nodata=mask_nodata, grid=grid)
+        return dataset.to_zarr(path, **kwargs)
+
+    def to_parquet(self, path, apply_scale: bool = False, mask_nodata: bool = False,
+                   format: str = 'long', **kwargs):
+        """Export the time series to Parquet, via :meth:`df` (semana 10).
+
+        Args:
+            path (str): Destination ``.parquet`` file.
+            apply_scale (bool): Apply the band scale/offset client-side (Ciclo iv).
+            mask_nodata (bool): Replace nodata samples with ``NaN`` (Ciclo iv).
+            format (str): ``'long'`` (default) or ``'wide'`` — see :meth:`df`.
+            **kwargs: Forwarded to :meth:`pandas.DataFrame.to_parquet`.
+
+        Raises:
+            ImportError: If pandas or a Parquet engine (pyarrow) is unavailable.
+        """
+        try:
+            import pyarrow  # noqa: F401  (default parquet engine)
+        except ImportError:
+            raise ImportError('Install pyarrow for Parquet export: pip install pyarrow')
+
+        frame = self.df(format=format, apply_scale=apply_scale, mask_nodata=mask_nodata)
+
+        if format == 'wide':
+            # Column labels may be an (attribute, location) tuple; Parquet needs
+            # plain string names. The datetime index is kept.
+            frame = frame.copy()
+            frame.columns = ['_'.join(map(str, c)) if isinstance(c, tuple) else str(c)
+                             for c in frame.columns]
+            return frame.to_parquet(path, **kwargs)
+
+        # long: flatten to a fully columnar table. The 'location' level is a
+        # (lon, lat) tuple, which Parquet cannot store, so split it into columns.
+        frame = frame.reset_index()
+        if 'location' in frame.columns:
+            frame['longitude'] = [loc[0] for loc in frame['location']]
+            frame['latitude'] = [loc[1] for loc in frame['location']]
+            frame = frame.drop(columns='location')
+        return frame.to_parquet(path, index=False, **kwargs)
+
+    def to_geotiff(self, path, attribute: str, apply_scale: bool = False,
+                   mask_nodata: bool = False, crs: str = 'EPSG:4326', **kwargs):
+        """Export a polygon/area band as a multi-band GeoTIFF (semana 10).
+
+        Rebuilds the ``(time, y, x)`` raster of ``attribute`` (see :meth:`to_xarray`
+        with ``grid=True``) and writes it as a north-up GeoTIFF whose **bands are
+        the timestamps**. Cells with no pixel are written as ``NaN`` (the file's
+        nodata). The affine transform comes from the pixel-centre spacing.
+
+        Args:
+            path (str): Destination ``.tif`` file.
+            attribute (str): The band to export.
+            apply_scale (bool): Apply the band scale/offset client-side (Ciclo iv).
+            mask_nodata (bool): Replace nodata samples with ``NaN`` (Ciclo iv).
+            crs (str): Coordinate reference system. Defaults to ``'EPSG:4326'``.
+            **kwargs: Extra fields merged into the rasterio profile.
+
+        Raises:
+            ValueError: If the area is smaller than 2x2 pixels.
+            KeyError: If ``attribute`` is not present in the time series.
+            ImportError: If rasterio is unavailable.
+        """
+        try:
+            import numpy
+            import rasterio
+            from rasterio.transform import from_origin
+        except ImportError:
+            raise ImportError('Install rasterio for GeoTIFF export: pip install rasterio')
+
+        locations = list(self._locations.values())
+        if locations and attribute not in locations[0].series['values']:
+            raise KeyError(
+                f"Attribute '{attribute}' not found. Available: "
+                f"{list(locations[0].series['values'])}"
+            )
+
+        xs, ys, cube = self._grid_cube(attribute, apply_scale, mask_nodata)
+        if len(xs) < 2 or len(ys) < 2:
+            raise ValueError('to_geotiff needs an area (a grid of at least 2x2 pixels).')
+
+        dx = xs[1] - xs[0]
+        dy = ys[1] - ys[0]
+        # Top-left corner of the raster (half a pixel out from the centre grid).
+        transform = from_origin(xs[0] - dx / 2, ys[-1] + dy / 2, dx, dy)
+        # North-up: row 0 must be the northernmost latitude, so flip the y axis.
+        data = cube[:, ::-1, :].astype('float64')
+        ntime, ny, nx = data.shape
+
+        profile = {
+            'driver': 'GTiff', 'height': ny, 'width': nx, 'count': ntime,
+            'dtype': 'float64', 'crs': crs, 'transform': transform,
+            'nodata': float('nan'),
+        }
+        profile.update(kwargs)
+
+        with rasterio.open(path, 'w', **profile) as dst:
+            for i in range(ntime):
+                dst.write(data[i], i + 1)
+                dst.set_band_description(i + 1, str(self.timeline[i])[:10])
+        return path
+
     @property
     def locations(self) -> dict:
         """Retrieve the time series locations matched as dict.
