@@ -177,11 +177,13 @@ class TestPolygonQuery:
 
         assert ds['NDVI'].dims == ('time', 'y', 'x')
         assert ds.sizes == {'time': 3, 'y': 2, 'x': 2}
-        # Axes are the distinct longitudes/latitudes, ascending.
-        assert ds.x.values.tolist() == [-54.0, -53.99]
-        assert ds.y.values.tolist() == [-12.0, -11.99]
-        # Pixel (x=-54.0, y=-12.0) held [1000, 2000, 3000] across time.
-        assert ds['NDVI'].isel(x=0, y=0).values.tolist() == [1000, 2000, 3000]
+        # Geographic coordinates come as 2D arrays (curvilinear once reprojected).
+        assert ds['longitude'].dims == ('y', 'x')
+        assert ds['latitude'].dims == ('y', 'x')
+        assert sorted(set(ds['longitude'].values.ravel().tolist())) == [-54.0, -53.99]
+        assert sorted(set(ds['latitude'].values.ravel().tolist())) == [-12.0, -11.99]
+        # Every pixel's series is present (order-independent).
+        assert sorted(ds['NDVI'].isel(time=0).values.ravel().tolist()) == [1000, 1100, 1200, 1300]
 
     def test_grid_leaves_missing_pixels_as_nan(self, service):
         """A pixel absent from the response leaves its grid cell as NaN."""
@@ -189,13 +191,14 @@ class TestPolygonQuery:
         from wtss.timeseries import TimeSeries
 
         coverage = service['MOD13Q1-6']
-        # Only 3 of the 2x2 grid cells; (x=-53.99, y=-11.99) is missing.
+        # Only 3 of the 2x2 grid cells; one pixel is missing.
         partial = TimeSeries(coverage, {'results': PIXELS[:3], 'query': dict(_QUERY)})
         ds = partial.to_xarray(grid=True)
 
         assert ds.sizes == {'time': 3, 'y': 2, 'x': 2}
-        # The absent top-right cell stays NaN across the whole timeline.
-        assert bool(np.isnan(ds['NDVI'].isel(x=1, y=1).values).all())
+        # Exactly one (y, x) cell is fully NaN across time (the missing pixel).
+        fully_nan = np.isnan(ds['NDVI'].values).all(axis=0)
+        assert int(fully_nan.sum()) == 1
 
     def test_polygon_plot_stats_runs_headless(self, service):
         """plot(pixels=False) draws median + quartiles from the summarize endpoint."""

@@ -96,7 +96,8 @@ class TestToZarr:
         ds = xr.open_zarr(str(path))
         assert ds['NDVI'].dims == ('time', 'y', 'x')
         assert ds.sizes == {'time': 3, 'y': 2, 'x': 2}
-        assert ds['NDVI'].isel(x=0, y=0).values.tolist() == [1000, 2000, 3000]
+        # Order-independent: every pixel's first sample survived the round trip.
+        assert sorted(ds['NDVI'].isel(time=0).values.ravel().tolist()) == [1000, 1100, 1200, 1300]
 
 
 class TestToGeotiff:

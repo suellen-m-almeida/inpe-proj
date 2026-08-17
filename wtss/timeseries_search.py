@@ -294,7 +294,13 @@ class TimeSeriesSearch:
         return self.coverage._timeseries(**options)
 
     def _time_series_it(self):
-        for page in range(self._pagination['next'], self._pagination['total_pages'] + 1):
+        # The first page is already loaded (see total_locations). Some servers omit
+        # 'next' (or send null) on the last page, so a missing 'next' means "no more
+        # pages to fetch" rather than an error.
+        start = self._pagination.get('next')
+        if start is None:
+            return
+        for page in range(start, self._pagination['total_pages'] + 1):
             ts = self._next_time_series(page)
 
             # Modify global ctx

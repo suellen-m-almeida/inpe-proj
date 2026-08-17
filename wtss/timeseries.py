@@ -268,30 +268,51 @@ class TimeSeries:
         return pandas.concat(parts, axis=1, names=['attribute', 'location'])
 
     def _grid_cube(self, attr_name, apply_scale: bool = False, mask_nodata: bool = False):
-        """Rebuild the 2D raster of one attribute as a ``(time, y, x)`` cube.
+        """Rebuild the native raster of one attribute as a ``(time, y, x)`` cube.
 
-        Pixels of an area query lie on a regular grid; the distinct longitudes and
-        latitudes define the x/y axes. Cells with no returned pixel stay ``NaN``.
+        Pixel centres reprojected to lon/lat are usually **not** a regular lon/lat
+        grid: e.g. MODIS in a sinusoidal projection has the column longitudes drift
+        from row to row. So we group pixels by the axis with fewer distinct values
+        into **rows**, order the other axis into **columns**, and return the actual
+        longitudes/latitudes as 2D arrays. ``y``/``x`` are therefore row/column
+        indices; cells with no returned pixel stay ``NaN``.
 
         Returns:
-            tuple: ``(xs, ys, cube)`` with the sorted longitudes ``xs``, latitudes
-            ``ys`` and a ``numpy`` array of shape ``(len(timeline), len(ys), len(xs))``.
+            tuple: ``(lon2d, lat2d, cube)`` — 2D longitude and latitude arrays of
+            shape ``(ny, nx)`` and a cube of shape ``(len(timeline), ny, nx)``.
         """
         import numpy
+        from collections import defaultdict
 
         locations = list(self._locations.values())
-        xs = sorted({location.x for location in locations})
-        ys = sorted({location.y for location in locations})
-        ix = {x: i for i, x in enumerate(xs)}
-        iy = {y: i for i, y in enumerate(ys)}
         ntime = len(self.timeline)
 
-        cube = numpy.full((ntime, len(ys), len(xs)), numpy.nan, dtype='float64')
-        for location in locations:
-            values = self._values_for(location, attr_name, apply_scale, mask_nodata)
-            n = min(len(values), ntime)
-            cube[:n, iy[location.y], ix[location.x]] = values[:n]
-        return xs, ys, cube
+        # Rows along the "cleaner" axis (fewer distinct values); columns along the
+        # other. Rows run north -> south when latitude drives them.
+        by_lat = len({loc.y for loc in locations}) <= len({loc.x for loc in locations})
+        row_of = (lambda loc: loc.y) if by_lat else (lambda loc: loc.x)
+        col_of = (lambda loc: loc.x) if by_lat else (lambda loc: loc.y)
+
+        buckets = defaultdict(list)
+        for loc in locations:
+            buckets[row_of(loc)].append(loc)
+        row_keys = sorted(buckets, reverse=by_lat)  # north (max lat) first
+        rows = [sorted(buckets[k], key=col_of) for k in row_keys]
+
+        nrows = len(rows)
+        ncols = max((len(r) for r in rows), default=0)
+
+        cube = numpy.full((ntime, nrows, ncols), numpy.nan, dtype='float64')
+        lon2d = numpy.full((nrows, ncols), numpy.nan, dtype='float64')
+        lat2d = numpy.full((nrows, ncols), numpy.nan, dtype='float64')
+        for ri, row in enumerate(rows):
+            for ci, loc in enumerate(row):
+                values = self._values_for(loc, attr_name, apply_scale, mask_nodata)
+                n = min(len(values), ntime)
+                cube[:n, ri, ci] = values[:n]
+                lon2d[ri, ci] = loc.x
+                lat2d[ri, ci] = loc.y
+        return lon2d, lat2d, cube
 
     def to_xarray(self, apply_scale: bool = False, mask_nodata: bool = False,
                   grid: bool = False):
@@ -333,14 +354,25 @@ class TimeSeries:
         time = pandas.to_datetime(self.timeline)
 
         if grid:
-            # Polygon/area case (Ciclo v): rebuild the 2D raster (time, y, x) from
-            # the sparse pixel centres (see _grid_cube).
+            # Polygon/area case (Ciclo v): rebuild the (time, y, x) raster. y/x are
+            # row/column indices; the real coordinates are 2D longitude/latitude
+            # arrays because the reprojected grid is curvilinear (see _grid_cube).
             data_vars = {}
-            xs = ys = None
+            lon2d = lat2d = None
             for attr in attributes:
-                xs, ys, cube = self._grid_cube(attr, apply_scale, mask_nodata)
+                lon2d, lat2d, cube = self._grid_cube(attr, apply_scale, mask_nodata)
                 data_vars[attr] = (('time', 'y', 'x'), cube)
-            return xarray.Dataset(data_vars, coords={'time': time, 'y': ys, 'x': xs})
+            ny, nx = lon2d.shape
+            return xarray.Dataset(
+                data_vars,
+                coords={
+                    'time': time,
+                    'y': numpy.arange(ny),
+                    'x': numpy.arange(nx),
+                    'longitude': (('y', 'x'), lon2d),
+                    'latitude': (('y', 'x'), lat2d),
+                },
+            )
 
         if len(locations) == 1:
             location = locations[0]
@@ -487,17 +519,24 @@ class TimeSeries:
                 f"{list(locations[0].series['values'])}"
             )
 
-        xs, ys, cube = self._grid_cube(attribute, apply_scale, mask_nodata)
-        if len(xs) < 2 or len(ys) < 2:
+        lon2d, lat2d, cube = self._grid_cube(attribute, apply_scale, mask_nodata)
+        ny, nx = cube.shape[1], cube.shape[2]
+        if nx < 2 or ny < 2:
             raise ValueError('to_geotiff needs an area (a grid of at least 2x2 pixels).')
 
-        dx = xs[1] - xs[0]
-        dy = ys[1] - ys[0]
-        # Top-left corner of the raster (half a pixel out from the centre grid).
-        transform = from_origin(xs[0] - dx / 2, ys[-1] + dy / 2, dx, dy)
-        # North-up: row 0 must be the northernmost latitude, so flip the y axis.
-        data = cube[:, ::-1, :].astype('float64')
-        ntime, ny, nx = data.shape
+        # North-up: row 0 must be the northernmost latitude.
+        if numpy.nanmean(lat2d[0]) < numpy.nanmean(lat2d[-1]):
+            cube = cube[:, ::-1, :]
+            lon2d, lat2d = lon2d[::-1], lat2d[::-1]
+
+        # Affine transform from the mean pixel spacing. The reprojected grid is
+        # slightly curvilinear, so this is a nearest-regular-grid approximation.
+        dx = abs(float(numpy.nanmean(numpy.diff(lon2d, axis=1))))
+        dy = abs(float(numpy.nanmean(numpy.diff(lat2d, axis=0))))
+        transform = from_origin(float(numpy.nanmin(lon2d)) - dx / 2,
+                                float(numpy.nanmax(lat2d)) + dy / 2, dx, dy)
+        data = cube.astype('float64')
+        ntime = data.shape[0]
 
         profile = {
             'driver': 'GTiff', 'height': ny, 'width': nx, 'count': ntime,
@@ -833,11 +872,12 @@ class TimeSeries:
                 f"{list(locations[0].series['values'])}"
             )
 
-        xs, ys, cube = self._grid_cube(attribute, apply_scale, mask_nodata)
-        if len(xs) < 2 or len(ys) < 2:
+        _lon2d, _lat2d, cube = self._grid_cube(attribute, apply_scale, mask_nodata)
+        ny, nx = cube.shape[1], cube.shape[2]
+        if nx < 2 or ny < 2:
             raise ValueError('plot_cube needs an area (a grid of at least 2x2 pixels).')
 
-        grid_x, grid_y = numpy.meshgrid(numpy.arange(len(xs)), numpy.arange(len(ys)))
+        grid_x, grid_y = numpy.meshgrid(numpy.arange(nx), numpy.arange(ny))
         finite = cube[numpy.isfinite(cube)]
         vmin = float(finite.min()) if finite.size else 0.0
         vmax = float(finite.max()) if finite.size else 1.0
