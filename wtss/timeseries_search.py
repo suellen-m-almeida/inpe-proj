@@ -213,24 +213,34 @@ class TimeSeriesSearch:
             limit (int): Limit the number of time series to plot. Default is 1000.
                 When None, display all. You may have performance issues.
             attributes (sequence): A sequence like ('red', 'nir') or ['red', 'nir']
+            interactive (bool): Render with plotly instead of matplotlib. Default
+                is False. See :meth:`wtss.timeseries.TimeSeries.plot`.
+
+        Returns:
+            None for the matplotlib rendering, which draws the chart itself. With
+            ``interactive=True``, the :class:`plotly.graph_objects.Figure` -- or,
+            under ``paginate=True``, the list of figures, one per page.
+
         Raises:
             ImportError: If datetime, matplotlib or numpy or datetime could not be imported.
         """
         if not self._pagination_allowed():
             _ = self.total_locations()
 
-            self._ts.plot(**kwargs)
-            return
+            return self._ts.plot(**kwargs)
 
         if paginate:
             _ = self.total_locations()
 
-            for ts in self.iterator():
-                ts.plot(**kwargs)
-            return
+            figures = [ts.plot(**kwargs) for ts in self.iterator()]
+            # matplotlib draws page by page and returns nothing; only the
+            # interactive rendering has figures worth handing back.
+            return figures if any(figure is not None for figure in figures) else None
+
         ts = self._time_series(with_pagination=paginate)
-        ts.plot(**kwargs)
+        figure = ts.plot(**kwargs)
         self._ts = ts
+        return figure
 
     def plot_map(self, attribute: str, **kwargs):
         """Plot the queried locations on a map, colored by a band value.

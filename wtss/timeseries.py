@@ -34,6 +34,13 @@ The keys available are:
 - ``timeline``: List of given location series.
 - ``values``: The map attributes and time series."""
 
+#: Two pixel centres closer than this (in degrees, about 11 cm) belong to the same
+#: grid line. Reprojecting a raster to lon/lat leaves each centre with a slightly
+#: different value, so a raster row arrives as hundreds of near-identical
+#: coordinates; the threshold sits far above that noise and far below the spacing
+#: of any Earth-observation raster, the finest of which are around half a metre.
+_SAME_CELL_DEGREES = 1e-6
+
 
 @dataclass
 class Location:
@@ -287,32 +294,123 @@ class TimeSeries:
         locations = list(self._locations.values())
         ntime = len(self.timeline)
 
-        # Rows along the "cleaner" axis (fewer distinct values); columns along the
+        if not locations:
+            empty = numpy.zeros((0, 0), dtype='float64')
+            return empty, empty, numpy.zeros((ntime, 0, 0), dtype='float64')
+
+        lats = numpy.array([loc.y for loc in locations], dtype='float64')
+        lons = numpy.array([loc.x for loc in locations], dtype='float64')
+        lat_slot, lat_centres = self._grid_slots(lats)
+        lon_slot, lon_centres = self._grid_slots(lons)
+
+        # Rows along the "cleaner" axis (fewer distinct slots); columns along the
         # other. Rows run north -> south when latitude drives them.
-        by_lat = len({loc.y for loc in locations}) <= len({loc.x for loc in locations})
-        row_of = (lambda loc: loc.y) if by_lat else (lambda loc: loc.x)
-        col_of = (lambda loc: loc.x) if by_lat else (lambda loc: loc.y)
+        by_lat = lat_centres.size <= lon_centres.size
+        row_slot = lat_slot if by_lat else lon_slot
+        col_value = lons if by_lat else lats
 
         buckets = defaultdict(list)
-        for loc in locations:
-            buckets[row_of(loc)].append(loc)
+        for i, loc in enumerate(locations):
+            buckets[int(row_slot[i])].append((float(col_value[i]), i))
         row_keys = sorted(buckets, reverse=by_lat)  # north (max lat) first
-        rows = [sorted(buckets[k], key=col_of) for k in row_keys]
+        rows = [sorted(buckets[key]) for key in row_keys]
+
+        # Column spacing, taken from the gaps actually observed inside the rows.
+        spacings = [numpy.diff([value for value, _ in row])
+                    for row in rows if len(row) > 1]
+        step = float(numpy.median(numpy.concatenate(spacings))) if spacings else 0.0
+
+        # Column slots come from where each row *starts*, not from the position of
+        # the pixel inside it. A lon/lat box cuts the reprojected grid unevenly, so
+        # neighbouring rows may hold a different number of pixels; packing them all
+        # from column zero would shift a whole row by one cell against its
+        # neighbours. Offsets accumulate row by row because the reprojected grid is
+        # curvilinear: consecutive rows drift by a fraction of a cell, which rounds
+        # to zero, while a genuinely missing edge pixel rounds to one.
+        offsets = [0]
+        for previous, current in zip(rows, rows[1:]):
+            drift = 0
+            if step:
+                drift = int(round((current[0][0] - previous[0][0]) / step))
+            offsets.append(offsets[-1] + drift)
+        base = min(offsets)
+        offsets = [offset - base for offset in offsets]
 
         nrows = len(rows)
-        ncols = max((len(r) for r in rows), default=0)
+        ncols = max((offset + len(row) for offset, row in zip(offsets, rows)),
+                    default=0)
 
         cube = numpy.full((ntime, nrows, ncols), numpy.nan, dtype='float64')
         lon2d = numpy.full((nrows, ncols), numpy.nan, dtype='float64')
         lat2d = numpy.full((nrows, ncols), numpy.nan, dtype='float64')
-        for ri, row in enumerate(rows):
-            for ci, loc in enumerate(row):
+        for ri, (offset, row) in enumerate(zip(offsets, rows)):
+            for position, (_, index) in enumerate(row):
+                ci = offset + position
+                loc = locations[index]
                 values = self._values_for(loc, attr_name, apply_scale, mask_nodata)
                 n = min(len(values), ntime)
                 cube[:n, ri, ci] = values[:n]
                 lon2d[ri, ci] = loc.x
                 lat2d[ri, ci] = loc.y
+
+        # A cell without a pixel still has a position: the grid geometry defines it,
+        # and only its *value* is missing. Leaving the coordinates as NaN would make
+        # the cube unplottable (pcolormesh rejects non-finite coordinates), so each
+        # row extrapolates them from the cells it did receive -- rows are evenly
+        # spaced, so a straight line through the known ones is exact.
+        self._fill_row_coordinates(lon2d)
+        self._fill_row_coordinates(lat2d)
         return lon2d, lat2d, cube
+
+    @staticmethod
+    def _fill_row_coordinates(grid):
+        """Complete each row of a coordinate grid by linear extrapolation, in place."""
+        import numpy
+
+        columns = numpy.arange(grid.shape[1], dtype='float64')
+        for ri, row in enumerate(grid):
+            known = numpy.isfinite(row)
+            if known.all() or known.sum() < 2:
+                continue
+            slope, intercept = numpy.polyfit(columns[known], row[known], 1)
+            grid[ri, ~known] = slope * columns[~known] + intercept
+
+    @staticmethod
+    def _grid_slots(values):
+        """Cluster nearly-equal coordinates into grid slots, tolerating float noise.
+
+        Reprojected pixel centres repeat a coordinate with tiny floating-point
+        differences: a Sentinel-2 area of 56 raster rows comes back with a distinct
+        latitude for every one of its pixels. Grouping by exact equality would turn
+        each pixel into its own row, so slots are cut only where consecutive values
+        jump by more than the noise floor.
+
+        The split uses a physical threshold rather than one inferred from the data:
+        two centres less than :data:`_SAME_CELL_DEGREES` apart are the same grid
+        line, because no Earth-observation raster has pixels that fine. Reading the
+        threshold off the data was tried first and proved brittle -- the observed
+        noise floor ranges over four orders of magnitude between collections, and a
+        grid with rows missing produces the same large jump as noise does.
+
+        Args:
+            values (numpy.ndarray): The coordinate of every location, in order.
+
+        Returns:
+            tuple: ``(slot, centres)`` -- the slot index of each input value, and
+            the representative coordinate of each slot.
+        """
+        import numpy
+
+        values = numpy.asarray(values, dtype='float64')
+        unique = numpy.unique(values)
+        if unique.size < 2:
+            return numpy.zeros(values.shape, dtype=int), unique
+
+        edges = numpy.flatnonzero(numpy.diff(unique) > _SAME_CELL_DEGREES) + 1
+
+        centres = numpy.array([group.mean() for group in numpy.split(unique, edges)])
+        slot = numpy.abs(values[:, None] - centres[None, :]).argmin(axis=1)
+        return slot, centres
 
     def to_xarray(self, apply_scale: bool = False, mask_nodata: bool = False,
                   grid: bool = False):
@@ -581,9 +679,26 @@ class TimeSeries:
                                         end_datetime=end_datetime,
                                         attributes=self._data['query']['attributes'])
 
+    def _prepared_values(self, attr_def, raw, apply_scale: bool, mask_nodata: bool):
+        """Turn a raw sample list into plot-ready values.
+
+        Honors the ``apply_scale``/``mask_nodata`` flags. Without them, keeps the
+        legacy behavior (mask nodata to ``None`` so it draws as a gap, raw scale).
+        When scaling, nodata is always masked so the sentinel is never scaled.
+
+        Shared by :meth:`plot` and :meth:`_plot_interactive` so both renderings
+        show exactly the same numbers.
+        """
+        if apply_scale or mask_nodata:
+            return self._coverage._apply_metadata(
+                list(raw), attr_def, apply_scale, mask_nodata or apply_scale)
+
+        nodata = attr_def['nodata']
+        return [value if value != nodata else None for value in raw]
+
     def plot(self, stats: bool = True, limit: Optional[int] = None,
              pixels: bool = True, apply_scale: bool = False,
-             mask_nodata: bool = False, **options):
+             mask_nodata: bool = False, interactive: bool = False, **options):
         """Plot the time series on a chart.
 
         Args:
@@ -601,6 +716,12 @@ class TimeSeries:
             mask_nodata (bool): Replace nodata samples with ``NaN`` (drawn as gaps).
                 Default is False; note the plot already hides nodata visually, so
                 this mainly matters combined with ``apply_scale``.
+            interactive (bool): Render with plotly instead of matplotlib, so the
+                chart can be zoomed and panned and each sample shows its date,
+                value and pixel on hover. Default is False. Unlike the matplotlib
+                rendering, which draws and returns ``None``, this returns the
+                :class:`plotly.graph_objects.Figure` for further customization.
+                Requires ``plotly`` (``pip install wtss[interactive]``).
 
         Keyword Args:
             attributes (sequence): A sequence like ('red', 'nir') or ['red', 'nir'] .
@@ -612,13 +733,18 @@ class TimeSeries:
         Raises:
             ImportError: If datetime, matplotlib or numpy or datetime could not be imported.
         """
+        if limit is not None and limit < 0:
+            raise ValueError('Limit cannot be negative')
+
+        if interactive:
+            return self._plot_interactive(stats=stats, limit=limit, pixels=pixels,
+                                          apply_scale=apply_scale,
+                                          mask_nodata=mask_nodata, **options)
+
         try:
             import matplotlib.pyplot as plt
         except ImportError:
             raise ImportError('You should install Matplotlib and Numpy!')
-
-        if limit is not None and limit < 0:
-            raise ValueError('Limit cannot be negative')
 
         # Get attribute value if user defined, otherwise use the first
         attributes = options.get('attributes') or self.attributes
@@ -663,17 +789,9 @@ class TimeSeries:
         for idx, axis in enumerate(axes):
             band_name = attributes[idx]
             attr_def = attribute_map[band_name]
-            nodata = attr_def['nodata']
 
-            # Turn a raw sample list into plot-ready values, honoring the
-            # apply_scale/mask_nodata flags. Without them, keep the legacy
-            # behavior (mask nodata to None so it draws as a gap, raw scale).
-            # When scaling, always mask nodata so the sentinel is never scaled.
-            def _prep(raw):
-                if apply_scale or mask_nodata:
-                    return self._coverage._apply_metadata(
-                        list(raw), attr_def, apply_scale, mask_nodata or apply_scale)
-                return [value if value != nodata else None for value in raw]
+            def _prep(raw, attr_def=attr_def):
+                return self._prepared_values(attr_def, raw, apply_scale, mask_nodata)
 
             if pixels:
                 for location in locations[:_limit]:
@@ -713,55 +831,137 @@ class TimeSeries:
         # Show only after every series has been drawn.
         fig.show()
 
-    def plot_map(self, attribute: str, datetime: Optional[str] = None,
-                 reduce: str = 'mean', apply_scale: bool = False,
-                 mask_nodata: bool = False, ax=None, cmap: str = 'viridis',
-                 markersize: int = 40, legend: bool = True,
-                 basemap: bool = False, source=None, **kwargs):
-        """Plot the queried locations on a map, colored by a band value.
+    def _plot_interactive(self, stats: bool = True, limit: Optional[int] = None,
+                          pixels: bool = True, apply_scale: bool = False,
+                          mask_nodata: bool = False, **options):
+        """Render the time series with plotly (see ``interactive`` in :meth:`plot`).
 
-        Complements :meth:`plot` (which shows *time*) by showing *space*: each
-        queried location (a point, or a pixel center for multipoint/polygon
-        queries) is drawn at its geographic position and colored by the value of
-        ``attribute``. Builds a :class:`geopandas.GeoDataFrame` in ``EPSG:4326``
-        and delegates to its ``.plot``.
-
-        Args:
-            attribute (str): The band whose value colors each location.
-            datetime (str, optional): A specific date from the timeline. When
-                ``None`` (default), the value is reduced over the whole timeline
-                using ``reduce``.
-            reduce (str): How to collapse the time axis when ``datetime`` is
-                ``None``: one of ``'mean'``, ``'median'``, ``'min'``, ``'max'``.
-            apply_scale (bool): Apply the band scale/offset client-side (Ciclo iv).
-            mask_nodata (bool): Replace nodata samples with ``NaN`` before
-                reducing, so the sentinel does not skew the color (Ciclo iv).
-            ax (matplotlib.axes.Axes, optional): Existing axes to draw on.
-            cmap (str): Matplotlib colormap name. Defaults to ``'viridis'``.
-            markersize (int): Point size. Defaults to 40.
-            legend (bool): Draw the colorbar. Defaults to True.
-            basemap (bool): Add an OpenStreetMap basemap via ``contextily``
-                (needs network and the optional ``contextily`` package).
-                Defaults to False so the map stays offline-friendly.
-            source: Tile provider for the basemap (e.g.
-                ``contextily.providers.OpenStreetMap.Mapnik``). When ``None``
-                (default) and ``basemap`` is True, OpenStreetMap Mapnik is used.
-            **kwargs: Forwarded to :meth:`geopandas.GeoDataFrame.plot`.
+        Mirrors the matplotlib rendering — same series, same colors, same
+        statistics — but returns the figure instead of drawing it, so the caller
+        can adjust the layout before displaying.
 
         Returns:
-            matplotlib.axes.Axes: The axes with the map.
+            plotly.graph_objects.Figure: One subplot per attribute.
+
+        Raises:
+            ImportError: If plotly could not be imported.
+            ValueError: If there is no attribute to plot.
+        """
+        try:
+            import plotly.graph_objects as go
+            from plotly.subplots import make_subplots
+        except ImportError:
+            raise ImportError('Install plotly for interactive plots: '
+                              'pip install wtss[interactive]')
+
+        attributes = options.get('attributes') or self.attributes
+
+        if not attributes:
+            raise ValueError('No attributes available to plot.')
+
+        x = [dt.datetime.fromisoformat(d.replace('Z', '+00:00')) for d in self.timeline]
+
+        attribute_map = {attr['name']: attr for attr in self._coverage.attributes}
+        locations = list(self._locations.values())
+
+        summarize = None
+        if stats:
+            summarize_kwargs = {}
+            if locations:
+                summarize_kwargs['start_datetime'] = locations[0].timeline[0]
+                summarize_kwargs['end_datetime'] = locations[0].timeline[-1]
+            summarize = self.summarize(**summarize_kwargs)
+
+        total = len(self._locations)
+        _limit = total if limit is None else min(limit, total)
+
+        figure = make_subplots(rows=len(attributes), cols=1, shared_xaxes=True,
+                               vertical_spacing=0.06)
+
+        for row, band_name in enumerate(attributes, start=1):
+            attr_def = attribute_map[band_name]
+
+            if pixels and locations:
+                # Every pixel series goes into a single trace, the runs separated
+                # by None. One trace instead of thousands keeps panning and
+                # zooming responsive, and the whole band toggles as one legend
+                # entry -- which is what the matplotlib rendering does visually.
+                xs, ys, labels = [], [], []
+                for location in locations[:_limit]:
+                    values = self._prepared_values(
+                        attr_def, location.series['values'][band_name],
+                        apply_scale, mask_nodata)
+                    label = f'{location.x:.5f}, {location.y:.5f}'
+                    xs.extend(x)
+                    ys.extend(values)
+                    labels.extend([label] * len(x))
+                    xs.append(None)
+                    ys.append(None)
+                    labels.append(None)
+
+                figure.add_trace(
+                    go.Scattergl(
+                        x=xs, y=ys, mode='lines',
+                        name=f'pixels ({_limit})',
+                        legendgroup='pixels', showlegend=row == 1,
+                        line={'color': '#7F9BB1', 'width': 1},
+                        opacity=0.2 if _limit > 100 else 0.6,
+                        customdata=labels,
+                        hovertemplate=f'%{{x|%d/%m/%Y}}<br>{band_name}: %{{y:.4f}}'
+                                      '<br>pixel: %{customdata}<extra></extra>',
+                    ), row=row, col=1)
+
+            if stats:
+                aggregations = summarize.values(band_name)
+                for name, color, width, group, rotulo in (
+                        ('q1', '#b19541', 1.5, 'quartis', 'quartis (q1, q3)'),
+                        ('q3', '#b19541', 1.5, 'quartis', 'quartis (q1, q3)'),
+                        ('median', '#B16240', 2.5, 'mediana', 'mediana')):
+                    values = self._prepared_values(
+                        attr_def, aggregations.values(name), apply_scale, mask_nodata)
+                    # Scattergl too, and never Scatter: plotly draws WebGL traces
+                    # on a canvas layer above the SVG one, so a Scatter here would
+                    # end up *under* the pixel band no matter the trace order.
+                    figure.add_trace(
+                        go.Scattergl(
+                            x=x, y=values[:len(x)], mode='lines', name=rotulo,
+                            legendgroup=group,
+                            # q1 and q3 share a single legend entry, as in plot().
+                            showlegend=row == 1 and name != 'q3',
+                            line={'color': color, 'width': width},
+                            hovertemplate=f'%{{x|%d/%m/%Y}}<br>{rotulo}: '
+                                          '%{y:.4f}<extra></extra>',
+                        ), row=row, col=1)
+
+            figure.update_yaxes(title_text=band_name, row=row, col=1)
+
+        title = 'Time Series'
+        if _limit < total:
+            title += f' (Showing {_limit} of {total} points)'
+
+        figure.update_layout(title={'text': title, 'x': 0.5, 'xanchor': 'center'},
+                             height=320 * len(attributes) + 90,
+                             hovermode='closest',
+                             legend={'orientation': 'h', 'yanchor': 'bottom',
+                                     'y': 1.02, 'xanchor': 'right', 'x': 1})
+
+        return figure
+
+    def _map_values(self, attribute, datetime, reduce, apply_scale, mask_nodata):
+        """Collapse each location's series into the single value that colours it.
+
+        Shared by :meth:`plot_map` and :meth:`_plot_map_interactive` so the static
+        and the clickable map always paint the same numbers.
+
+        Returns:
+            tuple: ``(locations, values)`` in matching order.
 
         Raises:
             ValueError: If there are no locations, ``reduce`` is unknown, or
                 ``datetime`` is not in the timeline.
             KeyError: If ``attribute`` is not present in the time series.
-            ImportError: If geopandas/matplotlib (or contextily) are missing.
         """
-        try:
-            import geopandas
-            import matplotlib.pyplot as plt
-        except ImportError:
-            raise ImportError('You should install geopandas and matplotlib!')
+        import numpy
 
         locations = list(self._locations.values())
         if not locations:
@@ -776,11 +976,12 @@ class TimeSeries:
         reducers = {
             'mean': numpy.nanmean, 'median': numpy.nanmedian,
             'min': numpy.nanmin, 'max': numpy.nanmax,
+            'std': numpy.nanstd,
         }
         if datetime is None and reduce not in reducers:
             raise ValueError(f"reduce must be one of {list(reducers)}, got {reduce!r}")
 
-        geoms, values = [], []
+        values = []
         for location in locations:
             samples = self._values_for(location, attribute, apply_scale, mask_nodata)
             if datetime is None:
@@ -790,8 +991,88 @@ class TimeSeries:
                 if datetime not in timeline:
                     raise ValueError(f'{datetime!r} is not in the timeline.')
                 value = samples[timeline.index(datetime)]
-            geoms.append(location.geom)
             values.append(value)
+
+        return locations, values
+
+    def plot_map(self, attribute: str, datetime: Optional[str] = None,
+                 reduce: str = 'mean', apply_scale: bool = False,
+                 mask_nodata: bool = False, ax=None, cmap: str = 'viridis',
+                 markersize: int = 40, legend: bool = True,
+                 basemap: bool = False, source=None, interactive: bool = False,
+                 limit: Optional[int] = None, **kwargs):
+        """Plot the queried locations on a map, colored by a band value.
+
+        Complements :meth:`plot` (which shows *time*) by showing *space*: each
+        queried location (a point, or a pixel center for multipoint/polygon
+        queries) is drawn at its geographic position and colored by the value of
+        ``attribute``. Builds a :class:`geopandas.GeoDataFrame` in ``EPSG:4326``
+        and delegates to its ``.plot``.
+
+        Args:
+            attribute (str): The band whose value colors each location.
+            datetime (str, optional): A specific date from the timeline. When
+                ``None`` (default), the value is reduced over the whole timeline
+                using ``reduce``.
+            reduce (str): How to collapse the time axis when ``datetime`` is
+                ``None``: one of ``'mean'``, ``'median'``, ``'min'``, ``'max'``,
+                ``'std'``. Use ``'std'`` to map how much each pixel varied over
+                the period, which highlights the heterogeneity within the area
+                instead of its overall level.
+            apply_scale (bool): Apply the band scale/offset client-side (Ciclo iv).
+            mask_nodata (bool): Replace nodata samples with ``NaN`` before
+                reducing, so the sentinel does not skew the color (Ciclo iv).
+            ax (matplotlib.axes.Axes, optional): Existing axes to draw on.
+            cmap (str): Matplotlib colormap name. Defaults to ``'viridis'``.
+            markersize (int): Point size. Defaults to 40.
+            legend (bool): Draw the colorbar. Defaults to True.
+            basemap (bool): Add an OpenStreetMap basemap via ``contextily``
+                (needs network and the optional ``contextily`` package).
+                Defaults to False so the map stays offline-friendly.
+            source: Tile provider for the basemap (e.g.
+                ``contextily.providers.OpenStreetMap.Mapnik``). When ``None``
+                (default) and ``basemap`` is True, OpenStreetMap Mapnik is used.
+            interactive (bool): Render a pannable, zoomable map with folium
+                instead of a static matplotlib figure. Default is False. Each
+                marker carries the series of its own pixel: **clicking a dot
+                opens that pixel's chart**, so the map answers "what happened
+                here over time", not only "what is the reduced value here".
+                Returns the :class:`folium.Map` rather than drawing it, and
+                requires ``folium`` (``pip install wtss[interactive]``).
+                ``markersize`` is not forwarded: matplotlib sizes markers by
+                area in points and folium by radius in pixels, so the
+                interactive map keeps its own default and is resized with
+                ``radius=`` instead.
+            limit (int, optional): Draw at most this many locations, for the
+                interactive map only. One popup per pixel gets heavy on large
+                areas; the legend then announces how many of how many are shown.
+            **kwargs: Forwarded to :meth:`geopandas.GeoDataFrame.plot`, or to
+                :class:`folium.Map` when ``interactive`` is True.
+
+        Returns:
+            matplotlib.axes.Axes: The axes with the map.
+
+        Raises:
+            ValueError: If there are no locations, ``reduce`` is unknown, or
+                ``datetime`` is not in the timeline.
+            KeyError: If ``attribute`` is not present in the time series.
+            ImportError: If geopandas/matplotlib (or contextily) are missing.
+        """
+        if interactive:
+            return self._plot_map_interactive(
+                attribute, datetime=datetime, reduce=reduce,
+                apply_scale=apply_scale, mask_nodata=mask_nodata, cmap=cmap,
+                legend=legend, limit=limit, **kwargs)
+
+        try:
+            import geopandas
+            import matplotlib.pyplot as plt
+        except ImportError:
+            raise ImportError('You should install geopandas and matplotlib!')
+
+        locations, values = self._map_values(attribute, datetime, reduce,
+                                             apply_scale, mask_nodata)
+        geoms = [location.geom for location in locations]
 
         gdf = geopandas.GeoDataFrame({attribute: values}, geometry=geoms, crs='EPSG:4326')
 
@@ -826,6 +1107,130 @@ class TimeSeries:
         ax.set_ylabel('latitude')
 
         return ax
+
+    def _series_svg(self, location, attribute, apply_scale, mask_nodata,
+                    width=300, height=120, pad=26):
+        """Draw one location's series as a standalone SVG, for a map popup.
+
+        The chart is plain markup with no script and no external asset, so it
+        survives inside a Leaflet popup and in an exported notebook alike.
+        """
+        import html
+        import numpy
+
+        samples = numpy.array(
+            self._values_for(location, attribute, apply_scale, mask_nodata),
+            dtype='float64')
+        timeline = [str(moment)[:10] for moment in self.timeline]
+        known = numpy.isfinite(samples)
+
+        if not known.any():
+            return (f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
+                    f'height="40"><text x="6" y="24" font-size="11" '
+                    f'font-family="sans-serif">sem dado em {html.escape(attribute)}'
+                    '</text></svg>')
+
+        low = float(numpy.nanmin(samples))
+        high = float(numpy.nanmax(samples))
+        span = (high - low) or 1.0
+        xs = numpy.linspace(pad, width - 6, len(samples))
+        ys = height - pad - (samples - low) / span * (height - 2 * pad)
+        points = ' '.join(f'{x:.1f},{y:.1f}'
+                          for x, y, ok in zip(xs, ys, known) if ok)
+
+        title = html.escape(f'{attribute}  ({location.x:.5f}, {location.y:.5f})')
+        return (
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">'
+            f'<text x="4" y="12" font-size="10" font-family="sans-serif">{title}</text>'
+            f'<line x1="{pad}" y1="{height - pad}" x2="{width - 6}" y2="{height - pad}" '
+            'stroke="#999" stroke-width="1"/>'
+            f'<line x1="{pad}" y1="{pad}" x2="{pad}" y2="{height - pad}" '
+            'stroke="#999" stroke-width="1"/>'
+            f'<polyline fill="none" stroke="#2a7f3f" stroke-width="1.6" points="{points}"/>'
+            f'<text x="2" y="{pad + 4}" font-size="8" font-family="sans-serif">{high:.2f}</text>'
+            f'<text x="2" y="{height - pad}" font-size="8" font-family="sans-serif">{low:.2f}</text>'
+            f'<text x="{pad}" y="{height - 8}" font-size="8" '
+            f'font-family="sans-serif">{timeline[0]}</text>'
+            f'<text x="{width - 62}" y="{height - 8}" font-size="8" '
+            f'font-family="sans-serif">{timeline[-1]}</text>'
+            '</svg>')
+
+    def _plot_map_interactive(self, attribute, datetime=None, reduce='mean',
+                              apply_scale=False, mask_nodata=False, cmap='viridis',
+                              markersize=6, legend=True, limit=None,
+                              tiles='OpenStreetMap', **kwargs):
+        """Render the locations on a slippy map (see ``interactive`` in :meth:`plot_map`).
+
+        Returns:
+            folium.Map: One circle marker per location, coloured like
+            :meth:`plot_map` and carrying its own series in the popup.
+
+        Raises:
+            ImportError: If folium could not be imported.
+            ValueError: If ``limit`` is negative, or as raised by :meth:`_map_values`.
+        """
+        try:
+            import folium
+            import numpy
+            from matplotlib import colors, pyplot
+        except ImportError:
+            raise ImportError('Install folium for interactive maps: '
+                              'pip install wtss[interactive]')
+
+        if limit is not None and limit < 0:
+            raise ValueError('Limit cannot be negative')
+
+        # The marker radius is in pixels here, unlike the point *area* matplotlib
+        # takes, so it gets its own name and never reaches the folium.Map kwargs.
+        markersize = kwargs.pop('radius', markersize)
+
+        locations, values = self._map_values(attribute, datetime, reduce,
+                                             apply_scale, mask_nodata)
+        total = len(locations)
+        drawn = total if limit is None else min(limit, total)
+
+        finite = [value for value in values if value == value]
+        norm = colors.Normalize(vmin=min(finite) if finite else 0.0,
+                                vmax=max(finite) if finite else 1.0)
+        colormap = pyplot.get_cmap(cmap)
+
+        centre = [float(numpy.mean([loc.y for loc in locations])),
+                  float(numpy.mean([loc.x for loc in locations]))]
+        figure = folium.Map(location=centre, tiles=tiles, **kwargs)
+
+        for location, value in list(zip(locations, values))[:drawn]:
+            colour = ('#808080' if value != value
+                      else colors.to_hex(colormap(norm(value))))
+            folium.CircleMarker(
+                location=[location.y, location.x],
+                radius=markersize,
+                color=None, fill=True, fill_opacity=0.85, fill_color=colour,
+                # The popup is what the reviewer asked for: click a dot, get the
+                # series of that very pixel instead of only its reduced value.
+                popup=folium.Popup(self._series_svg(location, attribute,
+                                                    apply_scale, mask_nodata),
+                                   max_width=340),
+                tooltip=f'{attribute} {reduce}: {value:.4f}',
+            ).add_to(figure)
+
+        # Frame the data rather than trusting a fixed zoom: areas range from a few
+        # pixels to a whole municipality.
+        lats = [loc.y for loc in locations[:drawn]]
+        lons = [loc.x for loc in locations[:drawn]]
+        if lats and lons:
+            figure.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]])
+
+        if legend:
+            rotulo = f'{attribute} ({reduce})' if datetime is None else f'{attribute} {datetime}'
+            if drawn < total:
+                rotulo += f' — {drawn} de {total} pixels'
+            figure.get_root().html.add_child(folium.Element(
+                '<div style="position:fixed;top:10px;left:60px;z-index:9999;'
+                'background:white;padding:4px 8px;border:1px solid #999;'
+                'border-radius:3px;font:12px sans-serif">'
+                f'{rotulo} — clique num pixel para ver a sua série</div>'))
+
+        return figure
 
     def plot_cube(self, attribute: str, apply_scale: bool = False,
                   mask_nodata: bool = False, ax=None, cmap: str = 'viridis',
@@ -872,7 +1277,25 @@ class TimeSeries:
                 f"{list(locations[0].series['values'])}"
             )
 
-        _lon2d, _lat2d, cube = self._grid_cube(attribute, apply_scale, mask_nodata)
+        lon2d, _lat2d, cube = self._grid_cube(attribute, apply_scale, mask_nodata)
+
+        # Crop to the rectangle every row shares, so each layer renders as a plain
+        # matrix. A lon/lat box cuts the reprojected grid along a diagonal, so the
+        # rows genuinely cover different column ranges and the full extent is a
+        # parallelogram. Drawn as-is, its staircase edge reads as structure in the
+        # data rather than as the shape of the query, so the stack keeps only the
+        # columns present in every row -- and then the rows complete within them.
+        # Coverage comes from the samples, not from the coordinates: those are
+        # filled for every cell of the grid, including the ones with no pixel.
+        covered = numpy.isfinite(cube).any(axis=0)
+        full_cols = numpy.flatnonzero(covered.all(axis=0))
+        if full_cols.size:
+            cube = cube[:, :, full_cols[0]:full_cols[-1] + 1]
+            covered = covered[:, full_cols[0]:full_cols[-1] + 1]
+            full_rows = numpy.flatnonzero(covered.all(axis=1))
+            if full_rows.size:
+                cube = cube[:, full_rows[0]:full_rows[-1] + 1, :]
+
         ny, nx = cube.shape[1], cube.shape[2]
         if nx < 2 or ny < 2:
             raise ValueError('plot_cube needs an area (a grid of at least 2x2 pixels).')

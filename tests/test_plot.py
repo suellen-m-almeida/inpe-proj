@@ -338,6 +338,25 @@ class TestPlotMap:
         values = list(ax.collections[0].get_array())
         assert values == [2000.0, 2001.0]
 
+    def test_reduce_std_maps_temporal_variability(self, service):
+        """``std`` colors each pixel by how much it varied, not by its level."""
+        import numpy as np
+
+        ts = _multipoint_timeseries(service, n_points=2)
+        ax = ts.plot_map('NDVI', reduce='std', legend=False)
+
+        # Both locations carry the same spread (1000, 2000, 3000 shifted by i),
+        # so the variability map is flat even though the means differ.
+        esperado = float(np.std([1000.0, 2000.0, 3000.0]))
+        values = list(ax.collections[0].get_array())
+        assert values == pytest.approx([esperado, esperado])
+
+    def test_unknown_reduce_lists_std_among_the_options(self, service):
+        ts = _multipoint_timeseries(service, n_points=2)
+
+        with pytest.raises(ValueError, match="'std'"):
+            ts.plot_map('NDVI', reduce='variance')
+
     def test_datetime_selects_a_single_date(self, service):
         ts = _multipoint_timeseries(service, n_points=2)
         ax = ts.plot_map('NDVI', datetime='2017-01-17', legend=False)
@@ -402,3 +421,264 @@ class TestPlotMap:
             ts.plot(attributes=['NDVI'], fig=fig, axes=[])
 
         assert fig._suptitle.get_text() == 'Time Series'
+
+
+class TestPlotInteractive:
+    """``plot(interactive=True)`` renders with plotly and returns the figure."""
+
+    def _pixel_trace(self, figure):
+        """Return the single trace carrying every pixel series, or None."""
+        return next((trace for trace in figure.data
+                     if trace.name and trace.name.startswith('pixels')), None)
+
+    def test_returns_a_plotly_figure_instead_of_drawing(self, service):
+        go = pytest.importorskip('plotly.graph_objects')
+        ts = _point_timeseries(service)
+
+        figure = ts.plot(attributes=['NDVI'], interactive=True)
+
+        assert isinstance(figure, go.Figure)
+        # The matplotlib path draws on the current figure; this one must not.
+        assert not plt.get_fignums()
+
+    def test_one_y_axis_per_attribute(self, service):
+        pytest.importorskip('plotly')
+        ts = _point_timeseries(service)
+
+        figure = ts.plot(attributes=['NDVI', 'EVI'], interactive=True)
+
+        titles = [axis.title.text for axis in figure.select_yaxes()]
+        assert titles == ['NDVI', 'EVI']
+
+    def test_all_pixel_series_share_a_single_trace(self, service):
+        pytest.importorskip('plotly')
+        ts = _multipoint_timeseries(service, n_points=3)
+
+        figure = ts.plot(attributes=['NDVI'], interactive=True, stats=False)
+
+        assert len(figure.data) == 1
+        trace = self._pixel_trace(figure)
+        # 3 locations x 3 dates, plus one None separating each run.
+        assert len(trace.x) == 3 * (len(TIMELINE) + 1)
+        assert trace.y.count(None) == 3
+
+    def test_hover_identifies_the_pixel(self, service):
+        pytest.importorskip('plotly')
+        ts = _multipoint_timeseries(service, n_points=2)
+
+        figure = ts.plot(attributes=['NDVI'], interactive=True, stats=False)
+
+        labels = {label for label in self._pixel_trace(figure).customdata
+                  if label is not None}
+        assert labels == {'-54.00000, -12.00000', '-53.99000, -12.00000'}
+
+    def test_pixels_false_leaves_only_the_statistics(self, service):
+        pytest.importorskip('plotly')
+        ts = _multipoint_timeseries(service, n_points=3)
+
+        figure = ts.plot(attributes=['NDVI'], interactive=True, pixels=False)
+
+        assert self._pixel_trace(figure) is None
+        assert {trace.name for trace in figure.data} == {'quartis (q1, q3)', 'mediana'}
+
+    def test_stats_false_drops_the_quantile_traces(self, service):
+        pytest.importorskip('plotly')
+        ts = _multipoint_timeseries(service, n_points=3)
+
+        figure = ts.plot(attributes=['NDVI'], interactive=True, stats=False)
+
+        assert {trace.name for trace in figure.data} == {'pixels (3)'}
+
+    def test_quartiles_share_one_legend_entry(self, service):
+        pytest.importorskip('plotly')
+        ts = _multipoint_timeseries(service, n_points=2)
+
+        figure = ts.plot(attributes=['NDVI'], interactive=True, pixels=False)
+
+        shown = [trace.name for trace in figure.data if trace.showlegend]
+        assert shown == ['quartis (q1, q3)', 'mediana']
+
+    def test_statistics_draw_above_the_pixel_band(self, service):
+        """Every trace must be WebGL so the drawing order is the trace order.
+
+        Plotly renders Scattergl on a canvas layer above the SVG one, so a plain
+        Scatter for the statistics would end up *under* the pixel band no matter
+        where it sits in the trace list.
+        """
+        pytest.importorskip('plotly')
+        ts = _multipoint_timeseries(service, n_points=3)
+
+        figure = ts.plot(attributes=['NDVI'], interactive=True)
+
+        assert {trace.type for trace in figure.data} == {'scattergl'}
+        nomes = [trace.name for trace in figure.data]
+        assert nomes[0] == 'pixels (3)'
+        assert nomes[-1] == 'mediana'
+
+    def test_limit_caps_the_series_and_titles_it(self, service):
+        pytest.importorskip('plotly')
+        ts = _multipoint_timeseries(service, n_points=3)
+
+        figure = ts.plot(attributes=['NDVI'], interactive=True, limit=2, stats=False)
+
+        assert len(self._pixel_trace(figure).x) == 2 * (len(TIMELINE) + 1)
+        assert figure.layout.title.text == 'Time Series (Showing 2 of 3 points)'
+
+    def test_negative_limit_raises_before_reaching_plotly(self, service):
+        ts = _point_timeseries(service)
+
+        with pytest.raises(ValueError, match='Limit cannot be negative'):
+            ts.plot(interactive=True, limit=-1)
+
+    def test_nodata_is_masked_to_none(self, service):
+        pytest.importorskip('plotly')
+        ts = _point_timeseries(service)
+
+        figure = ts.plot(attributes=['NDVI'], interactive=True, stats=False)
+
+        # POINT_TS_RESPONSE carries -3000 (the nodata) as the second NDVI sample.
+        assert self._pixel_trace(figure).y[:len(TIMELINE)] == (1000, None, 3000)
+
+    def test_apply_scale_matches_the_matplotlib_values(self, service):
+        pytest.importorskip('plotly')
+        coverage = service['MOD13Q1-6']
+        scaled_band = dict(coverage.attributes[0], scale=0.0001)
+        ts = _point_timeseries(service)
+
+        esperado = ts._prepared_values(scaled_band, [1000, -3000, 3000],
+                                       apply_scale=True, mask_nodata=True)
+
+        assert esperado[0] == pytest.approx(0.1)
+        assert esperado[1] is None or esperado[1] != esperado[1]
+
+    def test_empty_attributes_raise_before_building_the_figure(self, service):
+        pytest.importorskip('plotly')
+        coverage = service['MOD13Q1-6']
+        data = {
+            'results': POINT_TS_RESPONSE['results'],
+            'query': {**POINT_TS_RESPONSE['query'], 'attributes': []},
+        }
+        ts = TimeSeries(coverage, data)
+
+        with pytest.raises(ValueError, match='No attributes available to plot'):
+            ts.plot(interactive=True)
+
+    def test_deferred_search_returns_the_figure(self, service):
+        go = pytest.importorskip('plotly.graph_objects')
+        search = service['MOD13Q1-6'].ts(
+            attributes=['NDVI'],
+            geom=POINT_GEOM,
+            start_datetime='2017-01-01',
+            end_datetime='2017-02-28',
+        )
+
+        figure = search.plot(interactive=True)
+
+        assert isinstance(figure, go.Figure)
+
+
+class TestPlotMapInteractive:
+    """``plot_map(interactive=True)`` renders a folium map with clickable pixels."""
+
+    def _markers(self, figure):
+        """Return the circle markers added to a folium map."""
+        import folium
+
+        return [child for child in figure._children.values()
+                if isinstance(child, folium.CircleMarker)]
+
+    def _popup(self, marker):
+        """Return the rendered popup markup of a marker (folium nests it as a child)."""
+        import folium
+
+        popup = next(child for child in marker._children.values()
+                     if isinstance(child, folium.Popup))
+        return popup.html.render()
+
+    def test_returns_a_folium_map_instead_of_axes(self, service):
+        folium = pytest.importorskip('folium')
+        ts = _multipoint_timeseries(service, n_points=3)
+
+        figure = ts.plot_map('NDVI', interactive=True)
+
+        assert isinstance(figure, folium.Map)
+        assert not plt.get_fignums()
+
+    def test_one_marker_per_location(self, service):
+        pytest.importorskip('folium')
+        ts = _multipoint_timeseries(service, n_points=3)
+
+        figure = ts.plot_map('NDVI', interactive=True)
+
+        assert len(self._markers(figure)) == 3
+
+    def test_each_marker_carries_its_own_series(self, service):
+        """The reviewer's ask: clicking a dot brings up that pixel's series."""
+        pytest.importorskip('folium')
+        ts = _multipoint_timeseries(service, n_points=2)
+
+        figure = ts.plot_map('NDVI', interactive=True)
+
+        popups = [self._popup(marker) for marker in self._markers(figure)]
+        assert len(popups) == 2
+        # Cada popup traz um SVG com a série daquele pixel, e as coordenadas
+        # distinguem um do outro.
+        for popup, location in zip(popups, ts._locations.values()):
+            assert '<svg' in popup and '<polyline' in popup
+            assert f'{location.x:.5f}' in popup
+
+    def test_popup_is_self_contained_markup(self, service):
+        """No script and no external asset: the popup must survive a static export."""
+        pytest.importorskip('folium')
+        ts = _multipoint_timeseries(service, n_points=1)
+
+        figure = ts.plot_map('NDVI', interactive=True)
+
+        popup = self._popup(self._markers(figure)[0])
+        assert '<script' not in popup.lower()
+        # O namespace do SVG é um identificador, não um recurso baixado.
+        sem_namespace = popup.replace('http://www.w3.org/2000/svg', '')
+        assert 'http://' not in sem_namespace
+        assert 'https://' not in sem_namespace
+
+    def test_limit_caps_the_markers_and_says_so(self, service):
+        pytest.importorskip('folium')
+        ts = _multipoint_timeseries(service, n_points=3)
+
+        figure = ts.plot_map('NDVI', interactive=True, limit=2)
+
+        assert len(self._markers(figure)) == 2
+        assert '2 de 3 pixels' in figure.get_root().render()
+
+    def test_negative_limit_raises(self, service):
+        pytest.importorskip('folium')
+        ts = _multipoint_timeseries(service, n_points=2)
+
+        with pytest.raises(ValueError, match='Limit cannot be negative'):
+            ts.plot_map('NDVI', interactive=True, limit=-1)
+
+    def test_unknown_reduce_raises_before_building_the_map(self, service):
+        pytest.importorskip('folium')
+        ts = _multipoint_timeseries(service, n_points=2)
+
+        with pytest.raises(ValueError, match='reduce must be one of'):
+            ts.plot_map('NDVI', interactive=True, reduce='variance')
+
+    def test_nodata_pixel_still_gets_a_popup(self, service):
+        """A pixel whose samples are all masked must not break the map."""
+        pytest.importorskip('folium')
+        ts = _point_timeseries(service)
+
+        figure = ts.plot_map('NDVI', interactive=True, mask_nodata=True)
+
+        popup = self._popup(self._markers(figure)[0])
+        assert '<svg' in popup
+
+    def test_radius_resizes_the_markers_without_reaching_the_map(self, service):
+        """``radius`` is the folium marker size, and must not leak into folium.Map."""
+        pytest.importorskip('folium')
+        ts = _multipoint_timeseries(service, n_points=2)
+
+        figure = ts.plot_map('NDVI', interactive=True, radius=9)
+
+        assert {marker.options['radius'] for marker in self._markers(figure)} == {9}

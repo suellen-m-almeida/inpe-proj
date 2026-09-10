@@ -265,3 +265,135 @@ class TestPolygonServerError:
             # and must surface to the caller when the deferred query materialises.
             with pytest.raises(requests.exceptions.HTTPError):
                 service['MOD13Q1-6'].ts(**_QUERY).ts
+
+
+class TestGridReconstruction:
+    """``_grid_cube`` must rebuild a real matrix out of reprojected pixel centres."""
+
+    def _timeseries(self, service, centres):
+        """Build an area :class:`TimeSeries` from ``(lon, lat)`` pixel centres."""
+        from wtss.timeseries import TimeSeries
+
+        pixels = [_pixel(lon, lat, [1000 + i, 2000 + i, 3000 + i])
+                  for i, (lon, lat) in enumerate(centres)]
+        return TimeSeries(service['MOD13Q1-6'],
+                          {'results': pixels, 'query': dict(_QUERY)})
+
+    def test_float_noise_does_not_split_rows(self, service):
+        """Reprojected centres repeat a coordinate with tiny float differences.
+
+        Grouping by exact equality turned a 3x3 area into 9 rows of one pixel,
+        which silently broke the cube for Sentinel-2 and Landsat.
+        """
+        centres = []
+        for row in range(3):
+            for col in range(3):
+                ruido = (row * 3 + col) * 1e-9
+                centres.append((-54.00 + col * 0.01 + ruido,
+                                -12.00 + row * 0.01 + ruido))
+        ts = self._timeseries(service, centres)
+
+        ds = ts.to_xarray(grid=True)
+
+        assert ds.sizes == {'time': 3, 'y': 3, 'x': 3}
+
+    def test_short_rows_keep_their_columns_aligned(self, service):
+        """A row missing its westernmost pixel must not slide a whole row left.
+
+        Packing every row from column zero put pixels of different longitudes in
+        the same column, misregistering the raster by one cell.
+        """
+        import numpy as np
+
+        centres = [(-54.00, -12.00), (-53.99, -12.00), (-53.98, -12.00),
+                   (-53.99, -11.99), (-53.98, -11.99),           # sem o de oeste
+                   (-54.00, -11.98), (-53.99, -11.98), (-53.98, -11.98)]
+        ts = self._timeseries(service, centres)
+
+        lon2d, _lat2d, cube = ts._grid_cube('NDVI')
+
+        assert lon2d.shape == (3, 3)
+        # Cada coluna carrega uma única longitude, inclusive na célula sem pixel:
+        # a posição vem da geometria da grade, só o valor é que falta.
+        for coluna in range(lon2d.shape[1]):
+            assert len(set(np.round(lon2d[:, coluna], 6).tolist())) == 1
+        assert np.isfinite(lon2d).all()
+        # O buraco aparece nos dados: uma única célula sem amostra em todo o tempo.
+        assert int(np.isnan(cube).all(axis=0).sum()) == 1
+
+    def test_plot_cube_crops_to_the_shared_rectangle(self, service, monkeypatch):
+        """The cube draws only the columns every row shares.
+
+        A lon/lat box cuts the reprojected grid along a diagonal, so the full
+        extent is a parallelogram; drawn whole, its staircase edge reads as
+        structure in the data instead of the shape of the query.
+        """
+        from mpl_toolkits.mplot3d import Axes3D
+
+        centres = [(-54.00, -12.00), (-53.99, -12.00), (-53.98, -12.00), (-53.97, -12.00),
+                   (-54.00, -11.99), (-53.99, -11.99), (-53.98, -11.99), (-53.97, -11.99),
+                   (-53.99, -11.98), (-53.98, -11.98), (-53.97, -11.98), (-53.96, -11.98)]
+        ts = self._timeseries(service, centres)
+
+        # A união das linhas tem 5 colunas, com buracos nas pontas.
+        lon2d, _lat2d, _cube = ts._grid_cube('NDVI')
+        assert lon2d.shape == (3, 5)
+
+        desenhadas = []
+        original = Axes3D.plot_surface
+
+        def espiao(self, grid_x, grid_y, z, **kwargs):
+            desenhadas.append(grid_x.shape)
+            return original(self, grid_x, grid_y, z, **kwargs)
+
+        monkeypatch.setattr(Axes3D, 'plot_surface', espiao)
+        ts.plot_cube('NDVI')
+
+        # Uma camada por data, todas no retângulo de 3 colunas comuns.
+        assert desenhadas == [(3, 3)] * len(TIMELINE)
+
+
+class TestGridSlots:
+    """``_grid_slots`` decides which coordinates are the same raster line."""
+
+    def _slots(self, values):
+        import numpy as np
+
+        from wtss.timeseries import TimeSeries
+
+        _slot, centres = TimeSeries._grid_slots(np.array(values, dtype='float64'))
+        return centres.size
+
+    def test_merges_noise_two_decades_below_the_spacing(self):
+        """The noise floor varies between collections; 6e-7 against a 6e-5 spacing
+        is the case that a data-derived threshold got wrong, splitting one raster
+        row of an S2 area into 1903 rows of a single column.
+        """
+        valores = [(-13.55 + linha * 6.3e-5) + copia * 6.4e-7
+                   for linha in range(3) for copia in range(4)]
+
+        assert self._slots(valores) == 3
+
+    def test_merges_noise_four_decades_below_the_spacing(self):
+        valores = [(-12.0 + linha * 8.9e-5) + copia * 1.5e-9
+                   for linha in range(3) for copia in range(4)]
+
+        assert self._slots(valores) == 3
+
+    def test_clean_grid_keeps_every_line(self):
+        assert self._slots([-12.0, -11.99, -11.98, -11.97]) == 4
+
+    def test_missing_rows_do_not_collapse_the_grid(self):
+        """A gap of several pixels looks like the jump noise makes, but merging
+        there would fuse rows that are a legitimate pixel apart.
+        """
+        valores = [-12.0 + i * 0.01 for i in range(5)] + [-12.0 + 15 * 0.01]
+
+        assert self._slots(valores) == 6
+
+    def test_half_metre_pixels_stay_apart(self):
+        """The threshold must sit below the finest raster anyone would query."""
+        assert self._slots([-12.0 + i * 9e-6 for i in range(5)]) == 5
+
+    def test_single_value(self):
+        assert self._slots([-12.0]) == 1
