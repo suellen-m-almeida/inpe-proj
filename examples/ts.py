@@ -10,6 +10,7 @@
 
 import os
 
+import matplotlib.pyplot as plt
 import shapely.geometry
 
 from wtss import *
@@ -33,3 +34,6 @@ timeseries.plot()
 # Create GeoPandas DataFrame of Series
 df = timeseries.df()
 print(df)
+
+# Keep the chart window open until you close it (blocking).
+plt.show()

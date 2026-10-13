@@ -372,6 +372,18 @@ class TestPlotMap:
         # nanmean(1000, nan, 3000) == 2000, not (1000-3000+3000)/3.
         assert list(ax.collections[0].get_array()) == [2000.0]
 
+    def test_ticks_keep_the_full_coordinate(self, service):
+        """A small area must not be labelled with an offset ("-0.0020" + "-5.6e1")."""
+        ts = _multipoint_timeseries(service, n_points=3)
+        ax = ts.plot_map('NDVI', legend=False)
+        ax.figure.canvas.draw()
+
+        assert ax.xaxis.get_major_formatter().get_offset() == ''
+        assert ax.yaxis.get_major_formatter().get_offset() == ''
+        lo, hi = ax.get_xlim()
+        visiveis = [t for t in ax.xaxis.get_major_locator()() if lo <= t <= hi]
+        assert len(visiveis) <= 6   # MaxNLocator(5): at most 5 intervals drawn
+
     def test_unknown_attribute_raises_keyerror(self, service):
         ts = _point_timeseries(service)
         with pytest.raises(KeyError, match='RED'):

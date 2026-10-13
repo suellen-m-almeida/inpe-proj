@@ -1097,6 +1097,7 @@ class TimeSeries:
         try:
             import geopandas
             import matplotlib.pyplot as plt
+            from matplotlib.ticker import MaxNLocator
         except ImportError:
             raise ImportError('You should install geopandas and matplotlib!')
 
@@ -1135,6 +1136,12 @@ class TimeSeries:
         ax.set_title(f'{self._coverage.name} — {attribute} ({when})')
         ax.set_xlabel('longitude')
         ax.set_ylabel('latitude')
+
+        # A small area spans a few thousandths of a degree, so matplotlib would
+        # print the ticks as an offset ("-0.0020" plus "-5.6e1" in the corner).
+        # Keep the full coordinate on every tick, and few enough of them to fit.
+        ax.ticklabel_format(useOffset=False, style='plain')
+        ax.xaxis.set_major_locator(MaxNLocator(5))
 
         return ax
 
