@@ -310,19 +310,19 @@ class TestGeometryValidation:
     """Parity with the old ``TestDifferentGeometries``.
 
     Unsupported geometries are now rejected client-side with ValueError; the
-    supported ones (Point, Polygon and, newly, MultiPoint) are accepted.
+    supported ones (Point, Polygon, MultiPoint and MultiPolygon, which the server
+    answers like a Polygon) are accepted.
     """
 
-    @pytest.mark.parametrize('geom', [POINT, POLYGON, MULTIPOINT],
-                             ids=['point', 'polygon', 'multipoint'])
+    @pytest.mark.parametrize('geom', [POINT, POLYGON, MULTIPOINT, MULTIPOLYGON],
+                             ids=['point', 'polygon', 'multipoint', 'multipolygon'])
     def test_supported_geometry_accepted(self, backend, geom):
         # Building the search validates the geometry client-side; must not raise.
         assert backend.search(geom) is not None
 
     @pytest.mark.parametrize('geom',
-                             [LINESTRING, MULTILINESTRING, MULTIPOLYGON, GEOMETRYCOLLECTION],
-                             ids=['linestring', 'multilinestring',
-                                  'multipolygon', 'geometrycollection'])
+                             [LINESTRING, MULTILINESTRING, GEOMETRYCOLLECTION],
+                             ids=['linestring', 'multilinestring', 'geometrycollection'])
     def test_unsupported_geometry_rejected(self, backend, geom):
         with pytest.raises(ValueError):
             backend.search(geom)

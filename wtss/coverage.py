@@ -32,12 +32,15 @@ from .timeseries import TimeSeries
 from .timeseries_search import TimeSeriesQuery, TimeSeriesSearch
 from .utils import render_html
 
-SUPPORTED_GEOMS = ('multipoint', 'point', 'polygon')
+#: Geometry types the WTSS server answers. A MultiPolygon is clipped like a
+#: Polygon, so an area made of separate pieces is a single request.
+SUPPORTED_GEOMS = ('multipoint', 'point', 'polygon', 'multipolygon')
 
 #: Candidate band-metadata keys for scale/offset. WTSS servers are not
 #: consistent about the exact names, so we probe a few known spellings.
 _SCALE_KEYS = ('scale_factor', 'data_scale', 'scale')
-_OFFSET_KEYS = ('add_offset', 'data_offset', 'offset')
+#: ``scale_add`` is the spelling the BDC WTSS v4 uses in describe-coverage.
+_OFFSET_KEYS = ('add_offset', 'data_offset', 'offset', 'scale_add')
 
 
 class Coverage(dict):

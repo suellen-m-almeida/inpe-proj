@@ -33,9 +33,34 @@ from urllib3.util.retry import Retry
 from .coverage import Coverage
 from .utils import render_html
 
+#: Longest server error body, in characters, copied into an HTTPError message.
+_MAX_ERROR_DETAIL = 500
+
 #: Truthy/falsy string values accepted by :func:`strtobool`.
 _TRUE_VALUES = {'y', 'yes', 't', 'true', 'on', '1'}
 _FALSE_VALUES = {'n', 'no', 'f', 'false', 'off', '0'}
+
+
+def _error_detail(response) -> str:
+    """Return the reason a WTSS server gives in an error response, or ``''``.
+
+    The server explains a rejection in the body, e.g. ``{"code": 400,
+    "description": "The polygon area 3006.93 must be less than 3000ha."}``, while
+    ``raise_for_status`` only reports ``400 Client Error: BAD REQUEST``. JSON bodies
+    are searched for the usual message keys; any other body is used as plain text.
+    """
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+
+    if isinstance(body, dict):
+        for key in ('description', 'message', 'detail', 'error'):
+            if body.get(key):
+                return str(body[key])[:_MAX_ERROR_DETAIL]
+
+    text = (getattr(response, 'text', '') or '').strip()
+    return text[:_MAX_ERROR_DETAIL]
 
 
 def strtobool(value: str) -> int:
@@ -343,6 +368,15 @@ class WTSS:
                                          json=json, verify=self._verify_ssl,
                                          timeout=self._timeout)
 
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except HTTPError as error:
+            detail = _error_detail(response)
+            if not detail:
+                raise
+            # Same exception type and response, with the server's reason appended;
+            # chaining keeps the original traceback.
+            raise HTTPError(f'{error} -- {detail}', request=error.request,
+                            response=response) from error
 
         return response.json()

@@ -34,12 +34,11 @@ The keys available are:
 - ``timeline``: List of given location series.
 - ``values``: The map attributes and time series."""
 
-#: Two pixel centres closer than this (in degrees, about 11 cm) belong to the same
-#: grid line. Reprojecting a raster to lon/lat leaves each centre with a slightly
-#: different value, so a raster row arrives as hundreds of near-identical
-#: coordinates; the threshold sits far above that noise and far below the spacing
-#: of any Earth-observation raster, the finest of which are around half a metre.
-_SAME_CELL_DEGREES = 1e-6
+#: Largest distance, as a fraction of the pixel size, that a pixel centre may sit
+#: from the native grid before the rebuilt raster is refused. Centres served by the
+#: BDC land on the grid to about 1e-9 of a pixel once projected back, so anything
+#: near this bound means the CRS or the resolution do not describe the data.
+_GRID_TOLERANCE = 0.01
 
 
 @dataclass
@@ -274,22 +273,121 @@ class TimeSeries:
         parts = {attr: series.unstack('location') for attr, series in columns.items()}
         return pandas.concat(parts, axis=1, names=['attribute', 'location'])
 
-    def _grid_cube(self, attr_name, apply_scale: bool = False, mask_nodata: bool = False):
-        """Rebuild the native raster of one attribute as a ``(time, y, x)`` cube.
+    def _native_grid(self):
+        """Place every location on the coverage's native raster grid.
 
-        Pixel centres reprojected to lon/lat are usually **not** a regular lon/lat
-        grid: e.g. MODIS in a sinusoidal projection has the column longitudes drift
-        from row to row. So we group pixels by the axis with fewer distinct values
-        into **rows**, order the other axis into **columns**, and return the actual
-        longitudes/latitudes as 2D arrays. ``y``/``x`` are therefore row/column
-        indices; cells with no returned pixel stay ``NaN``.
+        A WTSS coverage is a raster in a projected CRS (the BDC Albers for S2,
+        Landsat and CBERS; the MODIS sinusoidal), and the pixel centres come back
+        reprojected to lon/lat. In lon/lat the grid is no longer aligned with the
+        parallels: the Albers rows are rotated (about 0.4 degrees at 56 W) and the
+        sinusoidal columns are sheared. Grouping the centres by latitude therefore
+        transposes or collapses the raster. Projected back to the native CRS, the
+        centres fall on exact multiples of the pixel size, so the row and column of
+        each one is a plain rounding::
+
+            col = round((x - xmin) / res_x)
+            row = round((ymax - y) / res_y)
 
         Returns:
-            tuple: ``(lon2d, lat2d, cube)`` — 2D longitude and latitude arrays of
-            shape ``(ny, nx)`` and a cube of shape ``(len(timeline), ny, nx)``.
+            dict: ``crs`` (the coverage CRS string), ``res_x``/``res_y`` (pixel
+            size in CRS units), ``x``/``y`` (centre coordinate of every column,
+            west to east, and of every row, north to south), and ``row``/``col``
+            (the cell of each location, in the order of :attr:`locations`).
+
+        Raises:
+            ValueError: If the coverage declares no CRS or no pixel size, if a
+                centre sits farther than :data:`_GRID_TOLERANCE` of a pixel from
+                the grid, or if two locations fall on the same cell. A wrong
+                raster is never returned silently.
         """
         import numpy
-        from collections import defaultdict
+        from pyproj import Transformer
+
+        locations = list(self._locations.values())
+        crs = self._coverage.crs if self._coverage is not None else None
+        if not crs:
+            raise ValueError('The coverage declares no CRS (bdc:crs/crs): the native '
+                             'grid of the area cannot be rebuilt.')
+
+        res_x, res_y = self._native_resolution(locations)
+
+        transformer = Transformer.from_crs('EPSG:4326', crs, always_xy=True)
+        xs, ys = transformer.transform([loc.x for loc in locations],
+                                       [loc.y for loc in locations])
+        xs = numpy.asarray(xs, dtype='float64')
+        ys = numpy.asarray(ys, dtype='float64')
+
+        # The lon/lat round trip leaves about 1e-9 m of noise on the centres
+        # (4786514.999999999 for 4786515); rounding to the micrometre restores the
+        # coordinates the grid really has, far inside the tolerance below.
+        x_min, y_max = round(float(xs.min()), 6), round(float(ys.max()), 6)
+        col_f = (xs - x_min) / res_x
+        row_f = (y_max - ys) / res_y
+        col = numpy.rint(col_f).astype(int)
+        row = numpy.rint(row_f).astype(int)
+
+        residual = float(max(numpy.abs(col_f - col).max(), numpy.abs(row_f - row).max()))
+        if residual > _GRID_TOLERANCE:
+            raise ValueError(
+                f'Pixel centres do not fall on the native grid of {crs!r} with pixel '
+                f'size {res_x} x {res_y}: one sits {residual:.3f} of a pixel away '
+                f'(tolerance {_GRID_TOLERANCE}). The coverage CRS or resolution does '
+                f'not describe these pixels, so no raster is built.')
+
+        cells = row.astype('int64') * (int(col.max()) + 1) + col
+        if numpy.unique(cells).size != cells.size:
+            raise ValueError('Two pixel centres fall on the same cell of the native '
+                             'grid; the raster cannot be rebuilt without losing one.')
+
+        nrows, ncols = int(row.max()) + 1, int(col.max()) + 1
+        return {
+            'crs': crs, 'res_x': res_x, 'res_y': res_y,
+            'x': x_min + res_x * numpy.arange(ncols),
+            'y': y_max - res_y * numpy.arange(nrows),
+            'row': row, 'col': col,
+        }
+
+    def _native_resolution(self, locations):
+        """Return the ``(res_x, res_y)`` pixel size, in the units of the coverage CRS.
+
+        Comes from the band metadata (``resolution_x``/``resolution_y``) and, when
+        the coverage does not declare it, from the ``pixel_size`` the server sends
+        with every location (``[res, -res]``, the sign marking a north-up raster).
+        """
+        bands = self._coverage.attributes if self._coverage is not None else []
+        for band in bands:
+            res_x, res_y = band.get('resolution_x'), band.get('resolution_y')
+            if res_x and res_y:
+                return abs(float(res_x)), abs(float(res_y))
+
+        size = locations[0].pixel_size if locations else None
+        if size and len(size) == 2 and size[0] and size[1]:
+            return abs(float(size[0])), abs(float(size[1]))
+
+        raise ValueError('The coverage declares no pixel size (resolution_x/'
+                         'resolution_y or pixel_size): the native grid of the area '
+                         'cannot be rebuilt.')
+
+    def _grid_cube(self, attr_name, apply_scale: bool = False, mask_nodata: bool = False,
+                   grid: Optional[dict] = None):
+        """Rebuild the native raster of one attribute as a ``(time, y, x)`` cube.
+
+        The cube follows the native grid of the coverage (see :meth:`_native_grid`):
+        row 0 is the northernmost row and column 0 the westernmost column, both in
+        the coverage CRS. Cells inside the grid's bounding rectangle that the query
+        did not return stay ``NaN``.
+
+        Args:
+            grid (dict, optional): A :meth:`_native_grid` already computed for this
+                time series, so several attributes share one projection pass.
+
+        Returns:
+            tuple: ``(lon2d, lat2d, cube)`` — the longitude and latitude of every
+            cell centre, shape ``(ny, nx)`` (known for every cell, since the grid
+            defines the position even where the value is missing), and the cube,
+            shape ``(len(timeline), ny, nx)``.
+        """
+        import numpy
 
         locations = list(self._locations.values())
         ntime = len(self.timeline)
@@ -298,119 +396,26 @@ class TimeSeries:
             empty = numpy.zeros((0, 0), dtype='float64')
             return empty, empty, numpy.zeros((ntime, 0, 0), dtype='float64')
 
-        lats = numpy.array([loc.y for loc in locations], dtype='float64')
-        lons = numpy.array([loc.x for loc in locations], dtype='float64')
-        lat_slot, lat_centres = self._grid_slots(lats)
-        lon_slot, lon_centres = self._grid_slots(lons)
+        grid = grid or self._native_grid()
+        lon2d, lat2d = self._cell_lonlat(grid)
 
-        # Rows along the "cleaner" axis (fewer distinct slots); columns along the
-        # other. Rows run north -> south when latitude drives them.
-        by_lat = lat_centres.size <= lon_centres.size
-        row_slot = lat_slot if by_lat else lon_slot
-        col_value = lons if by_lat else lats
-
-        buckets = defaultdict(list)
-        for i, loc in enumerate(locations):
-            buckets[int(row_slot[i])].append((float(col_value[i]), i))
-        row_keys = sorted(buckets, reverse=by_lat)  # north (max lat) first
-        rows = [sorted(buckets[key]) for key in row_keys]
-
-        # Column spacing, taken from the gaps actually observed inside the rows.
-        spacings = [numpy.diff([value for value, _ in row])
-                    for row in rows if len(row) > 1]
-        step = float(numpy.median(numpy.concatenate(spacings))) if spacings else 0.0
-
-        # Column slots come from where each row *starts*, not from the position of
-        # the pixel inside it. A lon/lat box cuts the reprojected grid unevenly, so
-        # neighbouring rows may hold a different number of pixels; packing them all
-        # from column zero would shift a whole row by one cell against its
-        # neighbours. Offsets accumulate row by row because the reprojected grid is
-        # curvilinear: consecutive rows drift by a fraction of a cell, which rounds
-        # to zero, while a genuinely missing edge pixel rounds to one.
-        offsets = [0]
-        for previous, current in zip(rows, rows[1:]):
-            drift = 0
-            if step:
-                drift = int(round((current[0][0] - previous[0][0]) / step))
-            offsets.append(offsets[-1] + drift)
-        base = min(offsets)
-        offsets = [offset - base for offset in offsets]
-
-        nrows = len(rows)
-        ncols = max((offset + len(row) for offset, row in zip(offsets, rows)),
-                    default=0)
-
-        cube = numpy.full((ntime, nrows, ncols), numpy.nan, dtype='float64')
-        lon2d = numpy.full((nrows, ncols), numpy.nan, dtype='float64')
-        lat2d = numpy.full((nrows, ncols), numpy.nan, dtype='float64')
-        for ri, (offset, row) in enumerate(zip(offsets, rows)):
-            for position, (_, index) in enumerate(row):
-                ci = offset + position
-                loc = locations[index]
-                values = self._values_for(loc, attr_name, apply_scale, mask_nodata)
-                n = min(len(values), ntime)
-                cube[:n, ri, ci] = values[:n]
-                lon2d[ri, ci] = loc.x
-                lat2d[ri, ci] = loc.y
-
-        # A cell without a pixel still has a position: the grid geometry defines it,
-        # and only its *value* is missing. Leaving the coordinates as NaN would make
-        # the cube unplottable (pcolormesh rejects non-finite coordinates), so each
-        # row extrapolates them from the cells it did receive -- rows are evenly
-        # spaced, so a straight line through the known ones is exact.
-        self._fill_row_coordinates(lon2d)
-        self._fill_row_coordinates(lat2d)
+        cube = numpy.full((ntime, grid['y'].size, grid['x'].size), numpy.nan, dtype='float64')
+        for loc, ri, ci in zip(locations, grid['row'], grid['col']):
+            values = self._values_for(loc, attr_name, apply_scale, mask_nodata)
+            n = min(len(values), ntime)
+            cube[:n, ri, ci] = values[:n]
         return lon2d, lat2d, cube
 
     @staticmethod
-    def _fill_row_coordinates(grid):
-        """Complete each row of a coordinate grid by linear extrapolation, in place."""
+    def _cell_lonlat(grid):
+        """Longitude and latitude of every cell centre of a native grid, ``(ny, nx)``."""
         import numpy
+        from pyproj import Transformer
 
-        columns = numpy.arange(grid.shape[1], dtype='float64')
-        for ri, row in enumerate(grid):
-            known = numpy.isfinite(row)
-            if known.all() or known.sum() < 2:
-                continue
-            slope, intercept = numpy.polyfit(columns[known], row[known], 1)
-            grid[ri, ~known] = slope * columns[~known] + intercept
-
-    @staticmethod
-    def _grid_slots(values):
-        """Cluster nearly-equal coordinates into grid slots, tolerating float noise.
-
-        Reprojected pixel centres repeat a coordinate with tiny floating-point
-        differences: a Sentinel-2 area of 56 raster rows comes back with a distinct
-        latitude for every one of its pixels. Grouping by exact equality would turn
-        each pixel into its own row, so slots are cut only where consecutive values
-        jump by more than the noise floor.
-
-        The split uses a physical threshold rather than one inferred from the data:
-        two centres less than :data:`_SAME_CELL_DEGREES` apart are the same grid
-        line, because no Earth-observation raster has pixels that fine. Reading the
-        threshold off the data was tried first and proved brittle -- the observed
-        noise floor ranges over four orders of magnitude between collections, and a
-        grid with rows missing produces the same large jump as noise does.
-
-        Args:
-            values (numpy.ndarray): The coordinate of every location, in order.
-
-        Returns:
-            tuple: ``(slot, centres)`` -- the slot index of each input value, and
-            the representative coordinate of each slot.
-        """
-        import numpy
-
-        values = numpy.asarray(values, dtype='float64')
-        unique = numpy.unique(values)
-        if unique.size < 2:
-            return numpy.zeros(values.shape, dtype=int), unique
-
-        edges = numpy.flatnonzero(numpy.diff(unique) > _SAME_CELL_DEGREES) + 1
-
-        centres = numpy.array([group.mean() for group in numpy.split(unique, edges)])
-        slot = numpy.abs(values[:, None] - centres[None, :]).argmin(axis=1)
-        return slot, centres
+        to_lonlat = Transformer.from_crs(grid['crs'], 'EPSG:4326', always_xy=True)
+        x2d, y2d = numpy.meshgrid(grid['x'], grid['y'])
+        lon2d, lat2d = to_lonlat.transform(x2d, y2d)
+        return numpy.asarray(lon2d, dtype='float64'), numpy.asarray(lat2d, dtype='float64')
 
     def to_xarray(self, apply_scale: bool = False, mask_nodata: bool = False,
                   grid: bool = False):
@@ -423,8 +428,11 @@ class TimeSeries:
         - **Multiple locations**: ``(time, location)``; ``longitude``/``latitude``
           are coordinates along ``location``.
         - **Grid (polygon/area)**, with ``grid=True``: ``(time, y, x)``, rebuilding
-          the 2D raster from the sparse pixel centres. ``x``/``y`` are the distinct
-          longitudes/latitudes; grid cells with no returned pixel are ``NaN``.
+          the raster on the coverage's native grid (see :meth:`_native_grid`).
+          ``x``/``y`` are the cell-centre coordinates in the coverage CRS (west to
+          east, north to south), stored in ``attrs['crs']`` together with the pixel
+          size; ``longitude``/``latitude`` are 2D coordinates of every cell. Cells
+          the query did not return are ``NaN``.
 
         Args:
             apply_scale (bool): Apply the band scale/offset client-side (Ciclo iv).
@@ -435,6 +443,8 @@ class TimeSeries:
 
         Raises:
             ImportError: If xarray (or pandas/numpy) could not be imported.
+            ValueError: With ``grid=True``, if the pixels do not fit the native
+                grid of the coverage (see :meth:`_native_grid`).
         """
         try:
             import numpy
@@ -452,24 +462,27 @@ class TimeSeries:
         time = pandas.to_datetime(self.timeline)
 
         if grid:
-            # Polygon/area case (Ciclo v): rebuild the (time, y, x) raster. y/x are
-            # row/column indices; the real coordinates are 2D longitude/latitude
-            # arrays because the reprojected grid is curvilinear (see _grid_cube).
+            # Polygon/area case (Ciclo v): rebuild the (time, y, x) raster on the
+            # native grid. x/y are native coordinates; longitude/latitude are 2D
+            # because that grid is rotated or sheared in lon/lat (see _native_grid).
+            native = self._native_grid()
             data_vars = {}
             lon2d = lat2d = None
             for attr in attributes:
-                lon2d, lat2d, cube = self._grid_cube(attr, apply_scale, mask_nodata)
+                lon2d, lat2d, cube = self._grid_cube(attr, apply_scale, mask_nodata,
+                                                     grid=native)
                 data_vars[attr] = (('time', 'y', 'x'), cube)
-            ny, nx = lon2d.shape
             return xarray.Dataset(
                 data_vars,
                 coords={
                     'time': time,
-                    'y': numpy.arange(ny),
-                    'x': numpy.arange(nx),
+                    'y': native['y'],
+                    'x': native['x'],
                     'longitude': (('y', 'x'), lon2d),
                     'latitude': (('y', 'x'), lat2d),
                 },
+                attrs={'crs': native['crs'],
+                       'res_x': native['res_x'], 'res_y': native['res_y']},
             )
 
         if len(locations) == 1:
@@ -582,30 +595,45 @@ class TimeSeries:
         return frame.to_parquet(path, index=False, **kwargs)
 
     def to_geotiff(self, path, attribute: str, apply_scale: bool = False,
-                   mask_nodata: bool = False, crs: str = 'EPSG:4326', **kwargs):
+                   mask_nodata: bool = False, crs: Optional[str] = None, **kwargs):
         """Export a polygon/area band as a multi-band GeoTIFF (semana 10).
 
-        Rebuilds the ``(time, y, x)`` raster of ``attribute`` (see :meth:`to_xarray`
-        with ``grid=True``) and writes it as a north-up GeoTIFF whose **bands are
-        the timestamps**. Cells with no pixel are written as ``NaN`` (the file's
-        nodata). The affine transform comes from the pixel-centre spacing.
+        Rebuilds the ``(time, y, x)`` raster of ``attribute`` on the coverage's
+        native grid (see :meth:`to_xarray` with ``grid=True``) and writes it as a
+        north-up GeoTIFF whose **bands are the timestamps**, each described by its
+        date. The file is in the **native CRS of the coverage** (the BDC Albers for
+        S2, Landsat and CBERS; the sinusoidal for MODIS) with the exact affine
+        transform of that grid, so every value lands in its original pixel and
+        nothing is resampled. Cells with no pixel are written as ``NaN``, which is
+        the file's nodata.
+
+        .. note::
+
+            Writing the area in another CRS, such as ``EPSG:4326``, is not
+            supported. The native grid is rotated or sheared in lon/lat, so it
+            would have to be resampled (``rasterio.warp``), which interpolates or
+            duplicates values. Reproject the file afterwards with GDAL or a GIS if
+            a lon/lat raster is required.
 
         Args:
             path (str): Destination ``.tif`` file.
             attribute (str): The band to export.
             apply_scale (bool): Apply the band scale/offset client-side (Ciclo iv).
             mask_nodata (bool): Replace nodata samples with ``NaN`` (Ciclo iv).
-            crs (str): Coordinate reference system. Defaults to ``'EPSG:4326'``.
+            crs (str, optional): Kept for compatibility. ``None`` (default) or the
+                coverage's own CRS writes the native grid; any other CRS raises
+                ``ValueError`` (see the note above).
             **kwargs: Extra fields merged into the rasterio profile.
 
         Raises:
-            ValueError: If the area is smaller than 2x2 pixels.
+            ValueError: If the area is smaller than 2x2 pixels, if the pixels do
+                not fit the native grid, or if ``crs`` asks for another CRS.
             KeyError: If ``attribute`` is not present in the time series.
             ImportError: If rasterio is unavailable.
         """
         try:
-            import numpy
             import rasterio
+            from rasterio.crs import CRS
             from rasterio.transform import from_origin
         except ImportError:
             raise ImportError('Install rasterio for GeoTIFF export: pip install rasterio')
@@ -617,35 +645,37 @@ class TimeSeries:
                 f"{list(locations[0].series['values'])}"
             )
 
-        lon2d, lat2d, cube = self._grid_cube(attribute, apply_scale, mask_nodata)
+        grid = self._native_grid() if locations else None
+        native_crs = CRS.from_user_input(grid['crs']) if grid else None
+        if crs is not None and native_crs is not None and CRS.from_user_input(crs) != native_crs:
+            raise ValueError(
+                f'to_geotiff writes the native grid of the coverage ({grid["crs"]!r}); '
+                f'writing it in {crs!r} would resample the pixels and is not supported. '
+                f'Reproject the written file with GDAL or a GIS instead.')
+
+        _lon2d, _lat2d, cube = self._grid_cube(attribute, apply_scale, mask_nodata,
+                                               grid=grid)
         ny, nx = cube.shape[1], cube.shape[2]
         if nx < 2 or ny < 2:
             raise ValueError('to_geotiff needs an area (a grid of at least 2x2 pixels).')
 
-        # North-up: row 0 must be the northernmost latitude.
-        if numpy.nanmean(lat2d[0]) < numpy.nanmean(lat2d[-1]):
-            cube = cube[:, ::-1, :]
-            lon2d, lat2d = lon2d[::-1], lat2d[::-1]
-
-        # Affine transform from the mean pixel spacing. The reprojected grid is
-        # slightly curvilinear, so this is a nearest-regular-grid approximation.
-        dx = abs(float(numpy.nanmean(numpy.diff(lon2d, axis=1))))
-        dy = abs(float(numpy.nanmean(numpy.diff(lat2d, axis=0))))
-        transform = from_origin(float(numpy.nanmin(lon2d)) - dx / 2,
-                                float(numpy.nanmax(lat2d)) + dy / 2, dx, dy)
-        data = cube.astype('float64')
-        ntime = data.shape[0]
+        # Row 0 is the northern row and column 0 the western one (see _native_grid),
+        # so the upper-left corner sits half a pixel beyond the first centres.
+        transform = from_origin(float(grid['x'][0]) - grid['res_x'] / 2,
+                                float(grid['y'][0]) + grid['res_y'] / 2,
+                                grid['res_x'], grid['res_y'])
+        ntime = cube.shape[0]
 
         profile = {
             'driver': 'GTiff', 'height': ny, 'width': nx, 'count': ntime,
-            'dtype': 'float64', 'crs': crs, 'transform': transform,
+            'dtype': 'float64', 'crs': native_crs, 'transform': transform,
             'nodata': float('nan'),
         }
         profile.update(kwargs)
 
         with rasterio.open(path, 'w', **profile) as dst:
             for i in range(ntime):
-                dst.write(data[i], i + 1)
+                dst.write(cube[i], i + 1)
                 dst.set_band_description(i + 1, str(self.timeline[i])[:10])
         return path
 
@@ -1280,7 +1310,7 @@ class TimeSeries:
         lon2d, _lat2d, cube = self._grid_cube(attribute, apply_scale, mask_nodata)
 
         # Crop to the rectangle every row shares, so each layer renders as a plain
-        # matrix. A lon/lat box cuts the reprojected grid along a diagonal, so the
+        # matrix. A lon/lat box cuts the native grid along a diagonal, so the
         # rows genuinely cover different column ranges and the full extent is a
         # parallelogram. Drawn as-is, its staircase edge reads as structure in the
         # data rather than as the shape of the query, so the stack keeps only the
@@ -1323,11 +1353,12 @@ class TimeSeries:
         if created:
             ax.view_init(elev=22, azim=-60)
 
-        # Axis titles: pull 'longitude'/'latitude' close to their numbers and push
-        # 'time' clear of the (wider) date labels, aiming for a similar gap on all
-        # three. The z tick pad also runs higher because the dates are long.
-        ax.set_xlabel('x (longitude)', labelpad=-2)
-        ax.set_ylabel('y (latitude)', labelpad=-2)
+        # x/y are the column and row of the native grid (row 0 is the northern one),
+        # not longitude and latitude. Axis titles: pull them close to their numbers
+        # and push 'time' clear of the (wider) date labels, aiming for a similar gap
+        # on all three. The z tick pad also runs higher because the dates are long.
+        ax.set_xlabel('x (grid column)', labelpad=-2)
+        ax.set_ylabel('y (grid row)', labelpad=-2)
         ax.set_zlabel('time', labelpad=23)
         ax.set_zticks(range(cube.shape[0]))
         ax.set_zticklabels([str(t)[:10] for t in self.timeline], fontsize=8)

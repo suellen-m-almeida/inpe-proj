@@ -16,6 +16,8 @@ comes from the same mocked polygon page used by ``test_polygon.py``.
 
 import pytest
 import responses
+from grade_sintetica import (MODIS_ORIGIN, MODIS_RES, SINUSOIDAL_MODIS,
+                             grid_block)
 
 from wtss import WTSS
 from wtss.timeseries import TimeSeries
@@ -32,8 +34,9 @@ ROOT_RESPONSE = {
 }
 COVERAGE_RESPONSE = {
     'fullname': 'MOD13Q1-6', 'description': 'demo',
-    'bands': [{'name': 'NDVI', 'nodata': -3000, 'data_type': 'int16'}],
-    'bdc:crs': '+proj=sinu', 'raster_size': {'xsize': 1, 'ysize': 1},
+    'bands': [{'name': 'NDVI', 'nodata': -3000, 'data_type': 'int16',
+               'resolution_x': MODIS_RES, 'resolution_y': MODIS_RES}],
+    'bdc:crs': SINUSOIDAL_MODIS, 'raster_size': {'xsize': 1, 'ysize': 1},
     'extent': {'type': 'Polygon',
                'coordinates': [[[-180, -90], [180, -90], [180, 90], [-180, 90], [-180, -90]]]},
     'timeline': TIMELINE,
@@ -43,17 +46,22 @@ COVERAGE_RESPONSE = {
 def _pixel(lon, lat, values):
     return {
         'pixel_center': {'type': 'Point', 'coordinates': [lon, lat]},
-        'pixel_size': [231.65, 231.65],
+        'pixel_size': [MODIS_RES, -MODIS_RES],
         'time_series': {'timeline': list(TIMELINE), 'values': {'NDVI': list(values)}},
     }
 
 
-#: A full 2x2 grid so the raster exporters have a proper area.
+#: A 2x2 block of real MODIS sinusoidal cells, by native (row, col); row 0 is north.
+CELLS = {(row, col): (lon, lat) for row, col, lon, lat
+         in grid_block(SINUSOIDAL_MODIS, MODIS_RES, MODIS_ORIGIN, -54.0, -12.0, 2, 2)}
+
+#: A full 2x2 grid so the raster exporters have a proper area: south-west,
+#: south-east, north-west, north-east.
 PIXELS = [
-    _pixel(-54.00, -12.00, [1000, 2000, 3000]),
-    _pixel(-53.99, -12.00, [1100, 2100, 3100]),
-    _pixel(-54.00, -11.99, [1200, 2200, 3200]),
-    _pixel(-53.99, -11.99, [1300, 2300, 3300]),
+    _pixel(*CELLS[1, 0], [1000, 2000, 3000]),
+    _pixel(*CELLS[1, 1], [1100, 2100, 3100]),
+    _pixel(*CELLS[0, 0], [1200, 2200, 3200]),
+    _pixel(*CELLS[0, 1], [1300, 2300, 3300]),
 ]
 
 _QUERY = {'attributes': ['NDVI'], 'start_datetime': '2017-01-01',
@@ -113,10 +121,12 @@ class TestToGeotiff:
             assert src.count == 3          # one band per timestamp
             assert (src.width, src.height) == (2, 2)
             assert src.descriptions[0] == '2017-01-01'
-            band1 = src.read(1)            # north-up: row 0 is the northern latitude
-            # Pixel (x=-54.0, y=-12.0) held 1000 at t=0; y=-12.0 is the southern row.
+            band1 = src.read(1)            # north-up: row 0 is the northern row
+            # The south-west pixel held 1000 at t=0.
             assert band1[1, 0] == 1000.0
-            assert src.crs.to_epsg() == 4326
+            # Written on the native sinusoidal grid, not resampled to lon/lat.
+            assert src.crs == rasterio.crs.CRS.from_user_input(SINUSOIDAL_MODIS)
+            assert src.res == (MODIS_RES, MODIS_RES)
 
     def test_geotiff_needs_area(self, area_ts, tmp_path):
         pytest.importorskip('rasterio')

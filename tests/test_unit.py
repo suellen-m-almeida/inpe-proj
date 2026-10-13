@@ -278,6 +278,16 @@ class TestApplyMetadata:
         out = Coverage._apply_metadata([10], {'data_scale': 2, 'data_offset': 1})
         assert out == [21]
 
+    def test_bdc_scale_add_is_the_offset(self):
+        """The BDC WTSS v4 declares the offset as ``scale_add``."""
+        out = Coverage._apply_metadata([1000, 2000], {'scale': 0.0001, 'scale_add': -0.1})
+        assert out == pytest.approx([0.0, 0.1])
+
+    def test_null_scale_add_means_no_offset(self):
+        """``scale_add: null``, as the BDC serves today, leaves the offset at zero."""
+        out = Coverage._apply_metadata([1000], {'scale': 0.0001, 'scale_add': None})
+        assert out == pytest.approx([0.1])
+
     def test_nodata_is_masked_before_scaling(self):
         out = Coverage._apply_metadata(
             [1000, -3000, 2000], {'nodata': -3000, 'scale_factor': 0.001})
