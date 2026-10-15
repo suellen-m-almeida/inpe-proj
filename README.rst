@@ -95,6 +95,17 @@ Linux, macOS, and Windows users can get ``wtss`` from the `Python Package Index 
         pip install wtss[matplotlib]
 
 
+Examples
+========
+
+
+The notebooks below are written in Portuguese and stored with their outputs, so they can be read without running them:
+
+- `examples/guia_de_uso.ipynb <examples/guia_de_uso.ipynb>`_: a walkthrough of the client from end to end, from discovering the coverages to the command line interface.
+
+- `examples/caso1/ <examples/caso1/>`_: an NDVI time series study of an agricultural area in Nova Mutum, Mato Grosso, Brazil, with Sentinel-2 data.
+
+
 Documentation
 =============
 
